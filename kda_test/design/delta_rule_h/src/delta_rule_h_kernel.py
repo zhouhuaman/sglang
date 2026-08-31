@@ -51,7 +51,7 @@ import triton.language as tl
 _BT = 64                              # chunk 大小
 _BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))    # V 维 tile 大小
 _NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
-_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "3"))  # 第五轮: tl.range 流水线 NS=3 最优 9.11ms
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -214,6 +214,7 @@ def _delta_rule_h_kernel(
     V: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
+    NS: tl.constexpr,
 ):
     """Delta Rule H triton kernel（固定长度 + USE_GK + USE_EXP2 子集）。
 
@@ -263,8 +264,9 @@ def _delta_rule_h_kernel(
     p_h0 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, K), (1, 0))
     b_h += tl.load(p_h0).to(tl.float32)
 
-    # 主循环: 逐 chunk 递推
-    for i_t in range(NT):
+    # 主循环: 逐 chunk 递推（tl.range + num_stages 软件流水线，预取下一 chunk 的
+    # w/u/k 加载以掩盖序列链点积延迟；第五轮优化，见 OPTIMIZATION_LOG.md）
+    for i_t in tl.range(NT, num_stages=NS):
         # ① 保存快照
         _store_h_full(h, i_t * stride_h, i_v * BV, K, BV, b_h)
 
@@ -365,7 +367,7 @@ def delta_rule_h_triton(
     _delta_rule_h_kernel[grid](
         k, u, w, v_new, gk, h, initial_state, initial_state_indices,
         T,
-        H=H, Hg=Hg, K=K, V=V, BT=BT, BV=BV,
+        H=H, Hg=Hg, K=K, V=V, BT=BT, BV=BV, NS=num_stages,
         num_warps=num_warps, num_stages=num_stages,
     )
     torch.npu.synchronize()

@@ -33,6 +33,16 @@ for lib in "$TORCH_LIB" "$TORCHNPU_LIB"; do
 done
 export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 
+# 默认屏蔽物理卡 0（本机该卡曾硬故障 open 507033）；用 VISIBLE_DEVICES 覆盖。
+# 屏蔽后 torch 的 npu:0 = 物理卡 1，初始化阶段不会触碰坏卡。
+: "${VISIBLE_DEVICES:=1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="$VISIBLE_DEVICES"
+
+# 指定 NPU 卡（默认可见卡中的 npu:0）。例: DEVICE=npu:1 bash run_cpu.sh ...
+: "${DEVICE:=}"
+DEV_ARGS=()
+if [ -n "$DEVICE" ]; then DEV_ARGS+=(--device "$DEVICE"); fi
+
 cd "$(dirname "$0")"
 
 # 用例表 (cases_meta.json) 若不存在, 先生成
@@ -48,12 +58,13 @@ if [ "$1" = "--msprof" ]; then
   for a in "$@"; do PROFILE_ARGS+=("$a"); done
   if [[ " $* " != *"--repeats"* ]]; then PROFILE_ARGS+=(--repeats 5); fi
   if [[ " $* " != *"--warmup"* ]]; then PROFILE_ARGS+=(--warmup 2); fi
-  echo "[msprof] msprof --output=$output --application=\"python3 bench.py --msprof ${PROFILE_ARGS[*]}\""
-  msprof --output="$output" --application="python3 bench.py --msprof ${PROFILE_ARGS[*]}"
+  PROFILE_ARGS+=("${DEV_ARGS[@]}")
+  echo "[msprof] msprof --export=on --output=$output --application=\"python3 bench.py --msprof ${PROFILE_ARGS[*]}\""
+  msprof --export=on --output="$output" --application="python3 bench.py --msprof ${PROFILE_ARGS[*]}"
   echo "msprof 数据已写入 $output; 解析:"
   echo "  python3 analyze_profile.py --latest-dir $output"
   echo "  python3 per_case_profile.py --latest-dir $output"
   exit $?
 fi
 
-python3 bench.py "$@"
+python3 bench.py "$@" "${DEV_ARGS[@]}"

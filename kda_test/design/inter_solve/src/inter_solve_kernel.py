@@ -36,6 +36,8 @@
   * ``inter_solve_triton``  —— triton kernel 版（1 CTA / chunk / head）
 """
 
+import os
+
 import torch
 import torch_npu  # noqa: F401  (必须在创建任何 npu 张量之前 import)
 import triton
@@ -43,6 +45,11 @@ import triton.language as tl
 
 _BT = 64   # chunk 大小
 _BC = 16   # sub-chunk 大小
+# 迭代实验参数（env 覆盖；默认与收敛配置一致）
+_NUM_STAGES = int(os.getenv("K3_NS", "1"))   # head 循环软件流水线级数
+_NUM_WARPS = int(os.getenv("K3_NW", "4"))
+_NP = int(os.getenv("K3_NP", "3"))           # 逆截断级数
+_HM = int(os.getenv("K3_HM", "16"))          # head 合并数（迭代实验用）
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -287,6 +294,7 @@ def _inter_solve_kernel(
     q, k, g, beta, Aqk, Akk_out,
     scale, T, TP, H: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr, NP: tl.constexpr,
+    NS: tl.constexpr,
 ):
     """融合 K3：grid=(cdiv(T,BT), cdiv(B*H,HM))。batch 由 i_hg 解码。
 
@@ -310,7 +318,7 @@ def _inter_solve_kernel(
     m_blk = (r // BC)[:, None] > (r // BC)[None, :]
     b_I = tl.where(r[:, None] == c[None, :], 1.0, 0.0)
     o_k = tl.arange(0, K)
-    for hh in range(HM):
+    for hh in tl.range(HM, num_stages=NS):
         i_h = hg0 * HM + hh
         qs = q + b_off * s_k + i_tc0 * s_k + i_h * K
         ks = k + b_off * s_k + i_tc0 * s_k + i_h * K
@@ -373,11 +381,12 @@ def inter_solve_triton(
         Aqk = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
     if Akk_out is None:
         Akk_out = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
-    HM = 16 if H % 16 == 0 else 1
+    HM = _HM if H % _HM == 0 else 1
     grid = (NT, B * (H // HM))
     _inter_solve_kernel[grid](
         q, k, g, beta, Aqk, Akk_out, float(scale), T, TP,
-        H=H, K=K, BT=BT, BC=BC, HM=HM, NP=3, num_warps=4,
+        H=H, K=K, BT=BT, BC=BC, HM=HM, NP=_NP, NS=_NUM_STAGES,
+        num_warps=_NUM_WARPS,
     )
     torch.npu.synchronize()
     return Aqk[:, :T], Akk_out[:, :T]

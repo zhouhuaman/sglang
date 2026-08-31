@@ -181,3 +181,31 @@ num_warps 1-16 / num_stages 1-2 对时间几乎无影响（±0.3ms），说明�
 
 **结论**: 同事的 6.4ms 是 BT=128 契约破坏的假象；在有效 BT=64 配置下同事
 10.23ms 慢于我们 9.50ms。官方 msprof 集成 K5 = **9.15ms**。
+
+---
+
+## Round 5: `tl.range` 软件流水线预取（2026-08-25，9.51→9.11ms）
+
+### 背景
+K5 grid = (1, H=96) 只有 96 CTA（1 head/CTA，无 head-merge 空间），256 chunk 的
+串行递推链（每 chunk 2 dot + 快照 store）是延迟关键路径。msprof 隔离 profile 报
+aic_scalar 59.5%，但此前 NW/NS 扫描全平（9.4–9.6ms）。
+
+### 根因：`num_stages` 被静默忽略
+chunk 循环是裸 `for i_t in range(NT)`——Triton 对非 `tl.range` 的循环不会做软件
+流水线调度，`num_stages` 传进 launch 被直接丢弃。**之前的 sweep_ns 扫描是 no-op。**
+
+### 改动（`src/delta_rule_h_kernel.py`）
+1. kernel 签名加 `NS: tl.constexpr`，driver 传 `NS=num_stages`。
+2. chunk 循环改 `for i_t in tl.range(NT, num_stages=NS)`。
+3. `_NUM_STAGES` 默认 2→**3**。
+
+### 结果
+| 配置 | 时间 |
+|------|------|
+| 原（range 裸 for，NS 失效） | 9.51ms |
+| **tl.range(NT, num_stages=3)** | **9.11ms** |
+
+集成 driver 验证 9.52ms（wall-clock 含设备抖动），精度 h/v max_diff = 0.0e+00。
+预取下一 chunk 的 w/u/k load 掩盖串行链点积延迟，约 −0.4ms。**不采纳 V 切分
+（每 chunk 串行 2× 冗余）与 HM（96 CTA 已是最低并行度，再合并降并行）。**

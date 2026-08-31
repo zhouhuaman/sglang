@@ -343,7 +343,7 @@ def _filter_cases(cases, group=None, start=0, limit=0):
 
 
 def run_correctness(meta_path, limit=0, max_diff=_MAX_DIFF, group=None,
-                    start=0, verbose=True):
+                    start=0, verbose=True, device="npu"):
     """模式 A: 逐 case 跑 6 kernel 的 torch/triton，写 correctness.csv。"""
     with open(meta_path, encoding="utf-8") as f:
         meta = json.load(f)
@@ -352,7 +352,6 @@ def run_correctness(meta_path, limit=0, max_diff=_MAX_DIFF, group=None,
         print("[!] 未检测到可用 NPU — 正确性模式需要 NPU（torch_npu 与 triton 两版都需 NPU）")
         return 2
 
-    device = "npu"
     cases = list(meta.items())
     cases = _filter_cases(cases, group=group, start=start, limit=limit)
 
@@ -434,7 +433,8 @@ def run_correctness(meta_path, limit=0, max_diff=_MAX_DIFF, group=None,
 # ─── 模式 B: msprof 采集（marker 分段）─────────────────────────────────────
 
 
-def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0):
+def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0,
+               device="npu"):
     """模式 B: 逐 case 派生输入 → 对每个支持的 kernel 在 marker 分界内跑
     K_torch N 次 + K_triton N 次（不计时）。写 profile_meta.json。"""
     with open(meta_path, encoding="utf-8") as f:
@@ -444,7 +444,6 @@ def run_msprof(meta_path, repeats=5, warmup=2, limit=0, group=None, start=0):
         print("[!] 未检测到可用 NPU — msprof 模式需要 NPU")
         return 2
 
-    device = "npu"
     cases = list(meta.items())
     cases = _filter_cases(cases, group=group, start=start, limit=limit)
 
@@ -545,13 +544,20 @@ def main(argv=None):
     p.add_argument("--warmup", type=int, default=2, help="预热次数")
     p.add_argument("--group", default=None, help="只跑指定 group (A/B/C/D)")
     p.add_argument("--start", type=int, default=0, help="从第 N 个 case 开始")
+    p.add_argument("--device", default=None,
+                   help="NPU 设备（默认 npu:0 当前卡）；如 npu:1。会先 torch.npu.set_device")
     a = p.parse_args(argv)
+
+    device = a.device or "npu"
+    if a.device:
+        torch.npu.set_device(a.device)
 
     if a.msprof:
         return run_msprof(a.meta, repeats=a.repeats, warmup=a.warmup,
-                          limit=a.limit, group=a.group, start=a.start)
+                          limit=a.limit, group=a.group, start=a.start,
+                          device=device)
     return run_correctness(a.meta, limit=a.limit, max_diff=a.max_diff,
-                            group=a.group, start=a.start)
+                            group=a.group, start=a.start, device=device)
 
 
 if __name__ == "__main__":

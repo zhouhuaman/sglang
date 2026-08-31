@@ -45,6 +45,8 @@ available" 错误）。真实运行环境由调用方在启动 python 前自行 
 参考实现（便于纯 CPU 校验逻辑）。
 """
 
+import os
+
 import torch
 import torch_npu  # noqa: F401  (必须在创建任何 npu 张量之前 import)
 
@@ -58,6 +60,11 @@ RCP_LN2 = 1.4426950216293335
 _DEFAULT_BT = 64
 _DEFAULT_BK = 32
 _DEFAULT_BV = 128
+
+# 迭代实验参数（env 覆盖；默认与收敛配置一致）
+# NW=4 为 2026-08-25 实验最优（7.38ms→6.93ms, -6%）；NS 无影响。
+_K6_NW = int(os.getenv("K6_NW", "4"))
+_K6_NS = int(os.getenv("K6_NS", "1"))
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -329,6 +336,86 @@ def chunk_gla_fwd_kernel_o(
              b_o.to(o.dtype.element_ty), mask=o_mask)
 
 
+@triton.jit(do_not_specialize=["T"])
+def chunk_gla_fwd_kernel_o_hm(
+    q, v, g, h, o, A,
+    scale, T,
+    H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
+    HM: tl.constexpr, NS: tl.constexpr,
+):
+    """head-merged 版（HM heads/CTA，grid=(cdiv(V,BV), NT, B*H//HM)）。
+
+    **标量寻址削减（2026-08-25，见 OPTIMIZATION_LOG.md 第五轮）**：msprof 显示
+    原 kernel aiv_scalar 97.8%（vector 标量/地址生成饱和）。每 CTA 的固定标量
+    设置（arange 向量、因果 mask m_s、各边界 mask、偏移向量）只依赖
+    (i_v, i_t, chunk)，与 head 无关——用 HM 头合并循环把固定设置摊薄 HM 倍，
+    全部循环不变向量提升到头循环外。目标 case 6.94ms → 4.75ms（-32%），
+    全部 bit-exact（max_diff 0.0 vs 原 kernel）。
+
+    数学与 ``chunk_gla_fwd_kernel_o`` 完全一致（跨块 q_gated@h^T + 块内
+    A_masked@v_new）；每个 head 独立累加 b_o 并独立写回。
+    """
+    i_v = tl.program_id(0)   # V 维 tile 索引
+    i_t = tl.program_id(1)   # chunk 索引
+    i_hg = tl.program_id(2)  # (batch, head-group) 索引
+    NT = tl.cdiv(T, BT)
+    n_hg = H // HM
+    i_b = i_hg // n_hg
+    hg0 = i_hg % n_hg
+    i_tg = i_b * NT + i_t
+    bos = i_b * T
+
+    s_q_t: tl.constexpr = H * K
+    s_v_t: tl.constexpr = H * V
+    s_h_v: tl.constexpr = K
+    s_a_t: tl.constexpr = H * BT
+
+    # ── 循环不变向量（与 head 无关，全部提升到头循环外）──
+    r = tl.arange(0, BT)
+    c = tl.arange(0, BT)
+    m_s = r[:, None].to(tl.float32) >= c[None, :].to(tl.float32)   # 因果 mask [BT,BT]
+    r_mask = (i_t * BT + r) < T
+    k_mask = tl.arange(0, BK) < K
+    v_mask = (i_v * BV + tl.arange(0, BV)) < V
+    q_offs = r[:, None] * s_q_t + tl.arange(0, BK)[None, :]
+    h_offs = tl.arange(0, BV)[:, None] * s_h_v + tl.arange(0, BK)[None, :]
+    v_offs = r[:, None] * s_v_t + tl.arange(0, BV)[None, :]
+    o_offs = r[:, None] * s_v_t + tl.arange(0, BV)[None, :]
+    A_offs = r[:, None] * s_a_t + c[None, :]
+    q_mask = r_mask[:, None] & k_mask[None, :]
+    h_mask = v_mask[:, None] & k_mask[None, :]
+    v_mask2 = r_mask[:, None] & v_mask[None, :]
+    o_mask = r_mask[:, None] & v_mask[None, :]
+
+    for hh in tl.range(HM, num_stages=NS):
+        i_h = hg0 * HM + hh
+        b_o = tl.zeros([BT, BV], dtype=tl.float32)
+
+        # ── 跨块: q_gated @ h^T ──
+        b_q = tl.load(q + (bos * H + i_h) * K + i_t * BT * s_q_t + q_offs,
+                      mask=q_mask, other=0.0)
+        b_q = (b_q * scale).to(b_q.dtype)
+        b_g = tl.load(g + (bos * H + i_h) * K + i_t * BT * s_q_t + q_offs,
+                      mask=q_mask, other=0.0)
+        b_qg = (b_q * tl.math.exp2(b_g)).to(b_q.dtype)
+        b_h = tl.load(h + (i_tg * H + i_h) * V * K + i_v * BV * s_h_v + h_offs,
+                      mask=h_mask, other=0.0)
+        b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+
+        # ── 块内: A_masked @ v_new ──
+        b_v = tl.load(v + (bos * H + i_h) * V + i_t * BT * s_v_t + i_v * BV + v_offs,
+                      mask=v_mask2, other=0.0)
+        b_A = tl.load(A + (bos * H + i_h) * BT + i_t * BT * s_a_t + A_offs,
+                      mask=r_mask[:, None], other=0.0)
+        b_A = tl.where(m_s, b_A, 0.0).to(b_v.dtype)
+        b_o += tl.dot(b_A, b_v)
+
+        # ── Store ──
+        tl.store(o + (bos * H + i_h) * V + i_t * BT * s_v_t + i_v * BV + o_offs,
+                 b_o.to(o.dtype.element_ty), mask=o_mask)
+
+
 def gla_output_kernel(
     q,
     v_new,
@@ -380,8 +467,35 @@ def gla_output_kernel(
     BK = 128 if K >= 128 else K
     BV = _DEFAULT_BV
     nw = 2 if BK >= 128 else 1
-    grid = (_cdiv(V, BV), NT, B * H)
 
+    # 标量寻址削减（第五轮，2026-08-25）：HM 头合并把每 CTA 固定标量设置摊薄
+    # HM 倍（目标 case 6.94→4.75ms）。H%16==0 时启用 HM=16；否则退化原 kernel。
+    HM = 16 if (H % 16 == 0 and BV <= V) else 1
+    if HM > 1:
+        grid = (_cdiv(V, BV), NT, B * (H // HM))
+        chunk_gla_fwd_kernel_o_hm[grid](
+            q=q,
+            v=v_new,
+            g=g,
+            h=h_flat,
+            o=o,
+            A=Aqk,
+            scale=float(scale),
+            T=T,
+            H=H,
+            K=K,
+            V=V,
+            BT=BT,
+            BK=BK,
+            BV=BV,
+            HM=HM,
+            NS=_K6_NS,
+            num_warps=_K6_NW,
+        )
+        torch.npu.synchronize()
+        return o
+
+    grid = (_cdiv(V, BV), NT, B * H)
     chunk_gla_fwd_kernel_o[grid](
         q=q,
         v=v_new,
@@ -397,8 +511,8 @@ def gla_output_kernel(
         BT=BT,
         BK=BK,
         BV=BV,
-        num_warps=nw,
-        num_stages=1,
+        num_warps=_K6_NW,
+        num_stages=_K6_NS,
     )
     torch.npu.synchronize()
     return o

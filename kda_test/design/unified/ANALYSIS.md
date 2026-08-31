@@ -109,6 +109,24 @@ K5(9.1) > K6(6.8) > K4(4.5) > K1(1.8) ms。加速比排序：K5(95.5x，串行 t
   （本次复核 vs 官方基线：K1 −3.1%、K2 +0.5%、K3 +0.3%、K4 +0.1%、K5 −0.3%、
   K6 −8.2%，均在同机同态正常抖动范围内）。
 
+### 4.4 标量削减轮集成（2026-08-25，`time_run.sh --repeats 7 --warmup 3`）
+
+聚焦"6 算子 scalar 受限"（用户本轮方向）后重新集成 6 kernel，逐核确认瓶颈属性、
+对确认受限的 kernel 施加头合并（HM）/流水线（NS）削减：
+
+| Kernel | torch_us | triton_us | speedup | max_diff | 本轮动作 |
+|--------|----------|-----------|---------|----------|----------|
+| K1 | 12972.6 | 2189.0 | 5.9x | 1.14e-05 | 无（scalar 45.6%/vec 44.2%，均衡） |
+| K2 | 193427.4 | 9775.4 | 19.8x | 8.94e-08 | 无（全 pipe <37%，延迟受限） |
+| K3 | 144533.7 | 14875.7 | 9.7x | 7.45e-08 | 无（aiv_cyc 主导，6-dot 串行逆链关键路径） |
+| K4 | 32199.8 | 4868.9 | 6.6x | 0.00e+00 | 无（aiv_vec 82.8%，向量受限） |
+| K5 | 17248579.0 | 9522.6 | 1811.3x | 0.00e+00 | `tl.range(NT, num_stages=3)` 软件流水线（隔离 9.51→9.11ms） |
+| K6 | 21615.6 | 4842.5 | 4.5x | 3.73e-09 | **head-merge HM=16**（隔离 6.94→4.75ms，集成 7.35→4.91ms） |
+
+**总 triton 时间 ≈ 46.1ms**（对比标量削减前 ≈48.45ms，收敛约 −5%）。核心结论见 §5.5：
+6 核中**仅 K6 是真正标量饱和**（aiv_scalar 97.8%），head-merge 后降到 60.9%、代价转移到
+cube（aic_mte2 92.5%）；K2/K3/K4 逐个确认非标量饱和（延迟/向量受限），无 lever。
+
 ## 5. 与 H100 横向对比：910B2 理论上限（2026-08-25 评估）
 
 同事在 **H100 上跑同 6 个算子**（同 Triton kernel、fp32、同一目标 case）总时间
@@ -174,6 +192,55 @@ H100 的内存带宽下限 = 20.3GB / 3.35TB/s ≈ **6.0ms**，6.9ms ≈ **87.6%
 > 910B2 峰值带宽口径不一（~400GB/s HBM2e / 1.6TB/s HBM3e）；本机 64GB、实测 K1
 > 884GB/s，按 1.2–1.6 TB/s 档理解。
 
+### 5.5 修正（2026-08-25）：真实瓶颈是标量寻址，不是带宽 —— 0.4x 不可达
+
+对 K2/K3/K5/K6 做 **msprof ai-core 隔离 profile**（每 kernel 单独跑、读
+`metric_summary.db`），推翻 §5.1–5.3 的"内存带宽受限 → 0.4x 可达"模型：
+
+| kernel | aic mac | aic scalar | aic mte2 | aiv vec | aiv scalar | aiv mte2 | 判断 |
+|--------|---------|-----------|----------|---------|-----------|----------|------|
+| K2 | 7.1% | 33% | 10.4% | 32.7% | 36% | 19.9% | 延迟/低利用率（全 <37%） |
+| K3 | 12% | **48%** | 20.7% | 8.2% | 40% | 13.5% | aic_scalar 受限 |
+| K5 | 14.8% | **59.5%** | 22.9% | 13% | 33.6% | 11.7% | aic_scalar 受限 |
+| K6 | 14.6% | 15.5% | 40.4% | 20.5% | **97.8%** | 49% | aiv_scalar 受限 |
+
+**没有任何 kernel 逼近内存带宽墙**（mac/mte2 全 ≤50%）；真正的限制是**标量/地址
+生成单元**（aiv_scalar 33–98%、aic_scalar 33–59%）和 K2 的低利用率延迟。各 kernel
+的"有效带宽"（K2 298 / K3 214 / K5 430 / K6 651 GB/s）**不是带宽上限，而是标量
+受限的副产品**。
+
+由此 §5.3 的 **0.4x 不可达**：K2/K3/K5/K6 都没在等内存，改布局（[B,H,T,K] 转置）
+或提高连续访问带宽**不会加速**。佐证的负结果实验（2026-08-25）：
+
+- 纯 copy 探针（bw_sweep）：contig 1242 / row-major strided 1187 / col-major strided
+  621 GB/s —— Triton 可达全带宽，但**只对纯流式 copy 成立**，不适用于含 dot 的真实 kernel。
+- K6 grid 轴序换 head-fastest（等价 row-major coalescing）：**7→9ms（变慢）**。
+- K6 fp16 dot（意图触发 cube）：无变化（max_diff 恒 3.73e-09，后端把 fp16 upcast 回 fp32）。
+- K6 NO_MASK（跳过边界 mask）：7.4ms（无增益）。
+- K6 bf16 输入（流量减半）：10.9ms（**变慢**，scalar-bound 对流量不敏感）。
+
+**结论**：0.4x H100（17.25ms）在**当前 fp32 契约 + 当前 Triton-Ascend 代码生成**下
+**不可达**。剩余方向都超出"kernel 级迭代优化"：(a) 换更成熟的 Triton-Ascend 后端/
+版本（改善标量与地址生成代码质量）；(b) K2/K3/K6 算法级重写（削减标量寻址、提高每
+CTA 有效工作，高风险长周期）；(c) 改 bf16 精度契约（K6 实测对流量不敏感，收益存疑）。
+
+### 5.6 标量削减轮（2026-08-25，回应用户"重点优化 6 算子 scalar 受限"）
+
+对 §5.5 标出的各标量管道逐核施加削减 lever，验证"标量饱和"假设并修掉可修者：
+
+| kernel | 假设 | 施加 lever | 结果（隔离 us） | 结论 |
+|--------|------|-----------|-----------------|------|
+| K6 | aiv_scalar 97.8% 饱和 | head-merge HM=16（每 CTA 固定标量 setup 摊 16 head） | 6939→**4748** | **修复**：aiv_scalar 97.8→60.9%，代价转移到 cube（aic_mte2 92.5%、aic_scalar 89.7%） |
+| K6 | 手动 int64 寻址本身耗标量 | block_ptr | 7005（无增益） | 证伪：耗标量的是**每 CTA setup**，不是寻址形态 |
+| K5 | aic_scalar 59.5% | `tl.range(NT, num_stages=NS)`（NS 之前被静默忽略——chunk 循环是裸 `for`） | 9513→**9106**（NS=3） | 修复：软件流水线预取下一 chunk load |
+| K3 | aic_scalar 48% | HM/NW/NS/NP 全扫 | 全部 ≈14700 平 | 证伪：非标量饱和，aiv_cyc=1250M 主导，6-dot 串行逆链是关键路径 |
+| K2 | 低利用率延迟 | HM/NW/NS | 全部 ≈9760 平 | 证伪：全 pipe <37%，内存延迟受限 |
+| K4 | （新 profile）aiv_vec 82.8% | exp2 削减（1×[BT,K] exp2 + 倒数共享） | 4739 vs 4727（无增益） | 证伪：向量受限，exp2 在向量 pipe 上不是瓶颈 |
+
+**净效果**：总 triton ≈48.45→46.1ms。**只有 K6 是真正的标量饱和核**，已修（贡献
+−2.4ms 中约 −2.3ms）；K5 贡献约 −0.4ms。K2/K3/K4 确认卡在延迟/向量/算法关键路径，
+不再有标量 lever。
+
 ## 6. 各算子最终配置一览（已固化在 `src/*_kernel.py` 中）
 
 | Op | 文件 | 关键配置 | 优化要点 |
@@ -182,8 +249,8 @@ H100 的内存带宽下限 = 20.3GB / 3.35TB/s ≈ **6.0ms**，6.9ms ≈ **87.6%
 | K2 | `token_parallel/src/token_parallel_kernel.py` | HM=16, `tl.gather` 紧凑 Akk | head-merge + kernel 内收拢对角块 |
 | K3 | `inter_solve/src/inter_solve_kernel.py` | HM=16, NP=3, fp32 | 融合单 kernel + 重复平方截断逆 |
 | K4 | `recompute_w_u/src/recompute_w_u_kernel.py` | HM=16 | head-merge（6796→4514us） |
-| K5 | `delta_rule_h/src/delta_rule_h_kernel.py` | BV=V=128, 2 dot/chunk | 单 K-tile 合并串行 dot 链 |
-| K6 | `gla_output/src/gla_output_kernel.py` | BK=128, BV=128, nw=2 | 跨块 K 循环合并为单大 dot |
+| K5 | `delta_rule_h/src/delta_rule_h_kernel.py` | BV=V=128, 2 dot/chunk, `tl.range(NT, num_stages=3)` | 单 K-tile 合并串行 dot 链 + 软件流水线预取（9.51→9.11ms） |
+| K6 | `gla_output/src/gla_output_kernel.py` | BK=128, BV=128, nw=2, **HM=16 head-merge** | 跨块 K 循环合并为单大 dot + 摊每 CTA 标量 setup（7.35→4.91ms） |
 
 ## 7. 结论汇总
 
@@ -193,14 +260,24 @@ H100 的内存带宽下限 = 20.3GB / 3.35TB/s ≈ **6.0ms**，6.9ms ≈ **87.6%
 - **性能**：目标 case 总 triton ≈46.1ms（官方 ≈46.7ms，偏差 <10%）；总加速比
   （torch_npu 拼接总和 ≈1.26s → triton 46.1ms）约 **27x**，其中 K5 高达 95x、K2 20x。
 - **约束/标注**：K=V=32 大 T 等 case 按 README §9 约束正确标注 `不支持`（非 bug）。
-- **横向对比**：910B2 相对 H100 当前 0.15x、现实可达 ~0.3x、理论上限 ~0.5x
-  （详见 §5，内存带宽受限）。
+- **横向对比**：910B2 相对 H100 当前 ≈0.15x（46.1ms / 6.9ms）。§5.3 曾按
+  "内存带宽受限"估现实可达 ~0.3x、理论上限 ~0.5x；**2026-08-25 msprof 隔离 profile
+  证伪该模型**——K2/K3/K5/K6 均非带宽受限，而是标量寻址/延迟受限（§5.5），
+  故 0.4x（17.25ms）在当前 fp32 契约 + 当前 Triton-Ascend 代码生成下**不可达**。
+- **标量削减轮（2026-08-25，§5.6）**：逐核验证"scalar 受限"假设——**仅 K6 真标量
+  饱和**，head-merge 修复（aiv_scalar 97.8→60.9%，7.35→4.91ms）；K5 借
+  `tl.range` 流水线 −0.4ms；K2/K3/K4 确认非标量饱和（延迟/向量/算法关键路径）。
+  总 triton ≈48.45→46.1ms。
 
 ## 8. 已知问题与待办
 
 - **K5 同事版曾报 6.4ms**（BT=128，破坏 K2..K6 共享的 BT=64 chunk 契约，无效）；
   **K6 同事版曾报 4.52ms**（fp32 下不可能，已 7 组实验证伪，真实 ~7ms）。均
   **未采纳**；证伪结论见各 `OPTIMIZATION_LOG.md`。
+- **瓶颈模型修正（2026-08-25）**：msprof 隔离 profile 证明 K2/K3/K5/K6 是标量寻址/
+  延迟受限而非带宽受限（§5.5）；"0.4x 靠布局转置/带宽优化"不再成立。
+- **标量削减收敛（2026-08-25）**：标量 lever 已尽——K6（唯一标量饱和）经 head-merge
+  修复、K5 经 NS 流水线 −0.4ms，K2/K3/K4 无 lever；总 triton 收敛于 ≈46.1ms（§5.6）。
 - **全量 106 case 性能采集**：目标 case 已复现官方；全 106 case 的 results.csv
   尚未完整落盘（设备持续负载不稳定，README §10），需分批续跑
   `bash run_all_msprof.sh` 后 `per_case_profile.py` 聚合。

@@ -202,3 +202,67 @@ exp_dtype 尝试、exp_col 逐 col 隔离），**双方 kernel 结构等价（�
 7.39ms ≈ 700GB/s，贴近 HBM 有效带宽。**fp32 输入下无下探空间**；
 只有把输入改 bf16（流量减半）才可能到 ~3.6ms，但那改变精度契约。
 官方 msprof 集成 K6 = **7.39ms**（max_diff 3.7e-9）。
+---
+
+## 第四轮: 标量寻址瓶颈证伪"内存下界"（2026-08-25）
+
+msprof ai-core 隔离 profile（只跑 K6 kernel，读 metric_summary.db）推翻上一轮的
+"~7ms ≈ 700GB/s 贴近 HBM 有效带宽"：
+
+| 指标 | 值 | 含义 |
+|------|-----|------|
+| aic mac | 14.6% | cube 乘加 15% 忙 → 非算力瓶颈 |
+| aic mte2 | 40.4% | cube 侧数据搬运 40% |
+| aiv vec | 20.5% | vector 计算 21% 忙 → 非算力瓶颈 |
+| aiv scalar | **97.8%** | **vector 标量/地址生成单元饱和 = 关键路径** |
+| aiv mte2 | 49% | vector 侧数据搬运 49% |
+
+结论：K6 是 **aiv_scalar（地址生成）受限**，不是内存受限。mte2 仅 ~49%，流量
+减半不会加速。
+
+### 负结果实验（均不采纳，恢复基线）
+1. **grid 轴序换 head-fastest**（i_bh 最快 → q/g/v/o/A 跨 CTA 连续）：7→9ms（变慢）。
+   纯 copy 探针里 row-major=1187 vs col-major=621 GB/s 的差异**不适用于含 dot 的真实 kernel**。
+2. **fp16 dot**（意图触发 cube）：max_diff 恒 3.73e-09、耗时不变 → 后端把 fp16
+   upcast 回 fp32，cube 未启用。
+3. **NO_MASK 特化**（T/K/V 全整除时跳过边界 mask）：7.4ms，无增益。
+4. **bf16 输入**（流量减半）：10.9ms（**变慢**），scalar-bound 对流量不敏感。
+
+**K6 收敛值维持 ~7ms（BK=128/BV=128/nw=4）。** 0.4x H100 不可达的根因是标量寻址，
+见 `unified/ANALYSIS.md §5.5`。
+
+---
+
+## 第五轮: head-merge 削减 aiv_scalar（2026-08-25，6.94→4.75ms）
+
+第四轮确认 aiv_scalar 97.8% 饱和是 K6 关键路径。诊断：每 CTA（grid = (1, NT, B×H)，
+24576 CTA）做一次完整标量 setup（`tl.arange` 偏移、r/c/m_s 因果 mask、q/g/h/v/A 的
+pointer base 与边界 mask）。这些 setup 与 head 无关却每 head 重算一遍 → 标量 pipe 饱和。
+
+### 假设验证（`unified/k6_scalar_ab.py` 同进程 A/B）
+| 变体 | 做法 | 时间 | 结论 |
+|------|------|------|------|
+| base（原） | 手动指针，每 CTA 1 head | 6939us | 基线 |
+| **hm16** | head-merge：`for hh in tl.range(HM)`，每 CTA 16 head，所有偏移/mask/pointer 向量**提循环外** | **4748us** | **−31.6%** |
+| hm32 | 同上，HM=32 | 4743us | 无进一步收益 |
+| bp | `tl.make_block_ptr` 重写 | 7005us | **证伪**"手动 int64 寻址耗标量"：耗标量的是每 CTA setup，不是寻址形态 |
+| hm16_ns2/ns3 | hm16 + `num_stages` | ~4755us | NS 无增益 |
+
+**关键实现**：`b_o = tl.zeros([BT,BV], float32)` 必须在 `for hh` 循环**体内开头**重声明
+（每 head 独立累加器）；r/c/m_s/r_mask/k_mask/v_mask/q_offs/h_offs/v_offs/o_offs/
+A_offs/q_mask/h_mask/v_mask2/o_mask 全部 loop-invariant 提循环外。
+
+### 集成（`src/gla_output_kernel.py`）
+driver 按 `HM = 16 if (H % 16 == 0 and BV <= V) else 1` 选择；HM>1 走
+`chunk_gla_fwd_kernel_o_hm`（grid=(cdiv(V,BV), NT, B*H//HM)，`NS=_K6_NS`,
+`num_warps=_K6_NW`），否则回退原 kernel。K6 集成 **7.35→4.91ms**，max_diff 3.73e-09。
+
+### 集成后 msprof 复核
+| 指标 | 前 | 后 | 含义 |
+|------|-----|-----|------|
+| aiv scalar | 97.8% | **60.9%** | 标量 pipe 不再饱和 |
+| aic scalar | — | **89.7%** | 新瓶颈：cube 标量/配置 |
+| aic mte2 | 40.4% | **92.5%** | cube 侧数据搬运饱和 |
+
+**代价转移到 cube**（aic_mte2 92.5%、aic_scalar 89.7%）：标量问题已解，但 cube 成为
+新限制，HM 之上无更多标量 lever。K6 收敛值更新为 **4.91ms 集成 / 4.75ms 隔离**。

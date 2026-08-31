@@ -26,6 +26,8 @@
     aiv_scalar_ratio 0.38→0.059 (首次 < 0.10 阈值)。
 """
 
+import os
+
 import torch
 import torch_npu  # noqa: F401  (必须在创建任何 npu 张量之前 import)
 import triton
@@ -33,6 +35,10 @@ import triton.language as tl
 
 _BT = 64   # chunk 大小
 _BC = 16   # sub-chunk 大小
+# 迭代实验参数（env 覆盖；默认与收敛配置一致）
+_K2_NW = int(os.getenv("K2_NW", "1"))
+_K2_NS = int(os.getenv("K2_NS", "1"))   # head 循环软件流水线级数
+_K2_HM = int(os.getenv("K2_HM", "16"))  # head 合并数（迭代实验用）
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -315,6 +321,7 @@ def _token_parallel_kernel_hm3(
     scale,
     T, H: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr,
+    NS: tl.constexpr,
 ):
     """head-merged v3: 同 hm2, 但 Akk 对角线块用 tl.gather 在 kernel 内收拢为
     [BT,BC] 紧凑写回 [B,T,H,BC]，消除 scratch 满宽写 + driver torch.gather
@@ -349,7 +356,7 @@ def _token_parallel_kernel_hm3(
     row_aqk = (chunk_start + o_r[:, None]) * H * BT
     row_akk = (chunk_start + o_r[:, None]) * H * BC
 
-    for hh in range(HM):
+    for hh in tl.range(HM, num_stages=NS):
         i_h = hg0 * HM + hh
         base_q = q + bos * H * K + i_h * K
         base_k = k + bos * H * K + i_h * K
@@ -433,13 +440,14 @@ def token_parallel_triton(
     # 从 B*H 缩到 B*H//16 (24576→1536 CTA)。H%16!=0 时 HM=1 退化为与原 kernel
     # 相同的 1 CTA/(chunk,head) 结构。
     if K == BK:
-        HM = 16 if H % 16 == 0 else 1
+        HM = _K2_HM if H % _K2_HM == 0 else 1
         grid = (NT, B * (H // HM))
         if Akk is None:
             Akk = torch.empty(B, TP, H, BC, device=dev, dtype=torch.float32)
         _token_parallel_kernel_hm3[grid](
             q, k, gk, beta, Aqk, Akk, float(scale),
-            T, H=H, K=K, BT=BT, BC=BC, HM=HM, num_warps=1,
+            T, H=H, K=K, BT=BT, BC=BC, HM=HM, NS=_K2_NS,
+            num_warps=_K2_NW,
         )
         torch.npu.synchronize()
         return Aqk[:, :T], Akk[:, :T]
