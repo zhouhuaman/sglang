@@ -121,9 +121,12 @@ def _segment_by_markers(rows, profile_meta):
       rows[marker[3i]   + 1 : marker[3i+1]] = torch 段
       rows[marker[3i+1] + 1 : marker[3i+2]] = triton 段
 
-    profile_meta 中 skipped=True 的段没有 marker（bench.py 跳过时不发 marker），
-    所以实际段数 = 非 skipped 段数。这里用 profile_meta 的非 skipped 子集
-    来标注段。
+    注意: bench.py 的 except 路径（triton 运行失败）也发 3 个 marker，所以
+    **失败段在 trace 里同样有 3 个 marker**。必须用 profile_meta 全量列表
+    （含 skipped 条目，按写入顺序）逐段对齐；不能只用非 skipped 子集，否则
+    中间 kernel 失败会让后续段全部错位（K5 失败 → K5 段被标成 K6、K6 段被
+    标成 seg5）。失败段由 pm.skipped 或"triton 子段无 kernel 行且时长≈0"
+    兜底判定。
     """
     # 收集所有 marker 行的索引
     marker_idx = [i for i, (n, _) in enumerate(rows) if n == MARKER_NAME]
@@ -135,12 +138,6 @@ def _segment_by_markers(rows, profile_meta):
 
     # 3-marker 协议: 每 (case, kernel) 有 3 个 marker
     n_seg = len(marker_idx) // 3
-
-    # profile_meta 中非 skipped 的段（这些才有实际 marker）
-    if profile_meta:
-        non_skipped = [pm for pm in profile_meta if not pm.get("skipped", False)]
-    else:
-        non_skipped = []
 
     segments = []
     for i in range(n_seg):
@@ -180,16 +177,22 @@ def _segment_by_markers(rows, profile_meta):
                     triton_op_seen = top
                     break
 
-        # 从 non_skipped profile_meta 取 case_id / kernel_id / repeats
-        if i < len(non_skipped):
-            pm = non_skipped[i]
+        # 按全量 profile_meta（含 skipped 条目，写入顺序与 marker 一致）逐段对齐
+        if i < len(profile_meta):
+            pm = profile_meta[i]
             case_id = pm.get("case_id", f"seg{i}")
             kernel_id = pm.get("kernel", f"K{i+1}")
             repeats = pm.get("repeats", 1)
+            seg_skipped = pm.get("skipped", False)
         else:
             case_id = f"seg{i}"
             kernel_id = f"K{i+1}"
             repeats = 1
+            seg_skipped = False
+        # 兜底: 无 skipped 标注但 triton 子段无任何 kernel 行且时长≈0 →
+        # triton 从未启动（编译失败），按失败段处理。
+        if not seg_skipped and triton_calls == 0 and triton_us < 1.0:
+            seg_skipped = True
         segments.append({
             "case_id": case_id,
             "kernel_id": kernel_id,
@@ -199,7 +202,7 @@ def _segment_by_markers(rows, profile_meta):
             "triton_durs": triton_durs,
             "torch_durs": torch_durs,
             "repeats": repeats,
-            "skipped": False,
+            "skipped": seg_skipped,
             "triton_op_seen": triton_op_seen,
         })
     return segments
@@ -282,7 +285,26 @@ def main(argv=None):
         kid = s["kernel_id"]
         cm = cases_meta.get(cid, {})
         max_diff, status = correctness.get((cid, kid), ("", ""))
-        if a.mean and s["repeats"] > 0:
+        if s["skipped"]:
+            # 失败段 (triton 未执行): 时长不可用, 输出 "-"
+            torch_us_s, triton_us_s, speedup = "-", "-", "-"
+            n_skip += 1
+            out_rows.append({
+                "case_id": cid,
+                "B": cm.get("B", ""),
+                "T": cm.get("T", ""),
+                "H": cm.get("H", ""),
+                "K": cm.get("K", ""),
+                "V": cm.get("V", ""),
+                "kernel": kid,
+                "torch_us": "-",
+                "triton_us": "-",
+                "speedup": "-",
+                "max_diff": max_diff,
+                "status": status or "不支持",
+            })
+            continue
+        elif a.mean and s["repeats"] > 0:
             # 仅取最后 repeats 次作为有效 repeat 数据（排除 warmup 的影响）
             # triton: 每次调用就是一条 op_summary 行，直接取最后 repeats 个
             tri_durs = s.get("triton_durs", [])

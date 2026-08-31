@@ -289,10 +289,15 @@ def _delta_rule_h_kernel(
         b_h *= _exp2(b_gk_last)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        # ④ 外积更新: b_h += tl.trans(tl.dot(k, b_v))（整 K 单 dot）
-        p_k = tl.make_block_ptr(k, (K, T), (1, stride_k), (0, i_t * BT), (K, BT), (0, 1))
-        b_k = tl.load(p_k, boundary_check=(1,))
-        b_h += tl.trans(tl.dot(b_k, b_v))
+        # ④ 外积更新: b_h += b_v^T @ k（[BV,BT]@[BT,K]）。
+        # 原写法 b_h += trans(dot(k, b_v)) 在 CANN 9.1 触发 hivm-plan-memory
+        # "Unsupported op for finding the root alloc" → ub overflow 误报；
+        # 行主 [BT,K] 加载 + 输入侧转置可正常编译（数学等价: trans(b_v)@b_k）。
+        # 实测: 此形态 11.5ms（vs 基线 9.15ms, +25%）；trans(dot) 加 where 打断
+        # 可编译但 21.8ms；b_ht 转置形态 22.3ms —— 均为当前最优可用方案。
+        p_k2 = tl.make_block_ptr(k, (T, K), (stride_k, 1), (i_t * BT, 0), (BT, K), (1, 0))
+        b_k2 = tl.load(p_k2)
+        b_h += tl.dot(tl.trans(b_v), b_k2)
 
     # Epilogue: 写回最终 state
     _store_h_full(ht, 0, i_v * BV, K, BV, b_h)
@@ -300,23 +305,18 @@ def _delta_rule_h_kernel(
 
 @triton.jit
 def _store_h_full(base, chunk_offset, v_start, K, BV, b_h):
-    """K=64 flat 1D store（高效路径），K≠64 用通用 2D 手动指针 store。
+    """通用 2D 手动指针 store（支持任意 K，含 K=64）。
 
     b_h 为整 K 单 tile [BV, K]。
-    K=64: 行步长恰为 64，BV*64 连续元素可 flat store，避免 2D int64 广播乘加。
-    K≠64: 用 2D 手动指针（offs_v[:,None]*K + offs_k[None,:]），支持任意 K。
-          注意勿用 flat reshape store —— triton-ascend MLIR bug（K=128 实测）。
+    注意: 不用 flat reshape store —— triton-ascend MLIR 的 expand_shape 在
+    CANN 9.1 下报 "collapsed dim size 2048 must equal 4096"（K=64 实测，
+    原始版 + zeros workaround 同样失败）；K=64 走本 2D 路径（行步长恰为 K，
+    每行 64 元素连续），与 K≠64 一致。
     """
-    if K == 64:
-        b_h_store = b_h + tl.zeros([BV, 64], dtype=tl.float32)
-        b_h_flat = tl.reshape(b_h_store, (BV * 64,))
-        p = base + chunk_offset + v_start * 64 + tl.arange(0, BV * 64)
-        tl.store(p, b_h_flat.to(base.dtype.element_ty))
-    else:
-        offs_v = v_start + tl.arange(0, BV)
-        offs_k = tl.arange(0, K)
-        ptr = base + chunk_offset + offs_v[:, None] * K + offs_k[None, :]
-        tl.store(ptr, b_h.to(base.dtype.element_ty))
+    offs_v = v_start + tl.arange(0, BV)
+    offs_k = tl.arange(0, K)
+    ptr = base + chunk_offset + offs_v[:, None] * K + offs_k[None, :]
+    tl.store(ptr, b_h.to(base.dtype.element_ty))
 
 
 def delta_rule_h_triton(

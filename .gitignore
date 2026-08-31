@@ -289,3 +289,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# msprof 采集产物（GB 级，不入库）
+kda_test/design/unified/prof_target*/

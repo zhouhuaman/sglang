@@ -16,6 +16,8 @@ from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KERNEL_ORDER = ["gate_chunk_cumsum", "token_parallel", "inter_solve", "recompute_w_u", "delta_rule_h", "gla_output"]
+# per_case_profile.py 的 results.csv 用 kernel id (K1..K6) 而非全名，加载时映射
+KID_TO_NAME = {f"K{i + 1}": name for i, name in enumerate(KERNEL_ORDER)}
 
 
 def _load_results(csv_path: str):
@@ -23,7 +25,10 @@ def _load_results(csv_path: str):
     if not os.path.exists(csv_path):
         raise SystemExit(f"[!] {csv_path} 不存在；请先跑 per_case_profile.py")
     with open(csv_path, encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r["kernel"] = KID_TO_NAME.get(r["kernel"], r["kernel"])
+    return rows
 
 
 def _is_num(s):
