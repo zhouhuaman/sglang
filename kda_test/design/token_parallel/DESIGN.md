@@ -59,59 +59,87 @@ i_ts = i_c*BT + i_s*BC   -- sub-chunk 起始 token(全局)
 
 ## 3. 计算思路
 
-### 3.1 Token-to-Subchunk 映射与并行分工
+> 口径注：本目录 `src/token_parallel_kernel.py` 已收敛到 **Route C**（每 CTA 一次载入整
+> chunk、两次 `[BT,K]@[K,BT]` 大 `tl.dot`、再按"对角 16×16 块 ∧ 块内因果"掩码；HM 头合并）。
+> §2 的 per-token grid（`(B*T,H)`）是早期 Route 的并行口径；**数学与 Route C 完全等价**，
+> 只是把同一 chunk 的 4 个窗口拼成一次大矩阵乘。以下计算逻辑按收敛 kernel 口径描述。
+
+### 3a. Aqk 的计算（query×gated-key 窗口打分）：`Aqk[t, j%BT] = scale·⟨q[t], k[j]⊙exp2(g[t]−g[j])⟩`
+
+**数学公式：**
 
 ```
-Token:    0  1 ... 15 | 16 17 ... 31 | 32 33 ... 47 | 48 49 ... 63 | ...
-          |<-- SC0 -->| |<-- SC1 -->| |<-- SC2 -->| |<-- SC3 -->|
-          |<---------------------- Chunk 0 (BT=64) --------------->|
-
-每个 token i 的 CTA 遍历同一 sub-chunk 内的历史 token:
-  CTA_i:   j = i_ts, i_ts+1, ..., min(i_t, i_ts+BC-1)
+对 chunk 内行 token i 与列 token j（同一窗口 s=(行//16)*16，且 j ≤ i）：
+  Aqk[i, j] = scale · Σ_κ  q[i,κ] · k[j,κ] · exp2( g[i,κ] − g[j,κ] )
+窗口外 / 窗口内 j > i 的位置 = 0。
 ```
 
-每个 CTA 的工作负载随 token 在 sub-chunk 内的位置线性增长（最坏 BC 次迭代）。
+- `exp2(g[i]−g[j])`：逐 K 通道的衰减因子（`i==j` 不衰减，`j<i` 压弱早期 key）；
+- Aqk **含对角线**；写回列 = `j % BT`（chunk 内位置），非对角块恒 0。
 
-### 3.2 Inner Loop
+### 3b. Akk 的计算（key·β × gated-key 窗口打分）：`Akk[t, j'] = ⟨k[t]·β[t], k[j]⊙exp2(g[t]−g[j])⟩`
 
-```python
-for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-```
-
-循环内（对每个 j）：
+**数学公式：**
 
 ```
-Step G:  Gate 衰减因子: exp2(g[i] - g[j])     (dtype fp32)
-Step K:  gated key:     kgj = k[j] * exp2(g[i] - g[j])
-Step Q:  Aqk = sum(q[i] * kgj) * scale
-Step K:  Akk = sum(k[i]*beta[i] * kgj) * (j < i_t ? 1 : 0)
+对 chunk 内行 token i 与列 token j（同窗口，且 j < i）：
+  Akk[i, j] = Σ_κ  (k[i,κ]·β[i]) · k[j,κ] · exp2( g[i,κ] − g[j,κ] )
+对角线（j==i）及窗口外 = 0。紧凑写回列 = j − s（0..BC-1）。
 ```
 
-### 3.3 Aqk / Akk 公式
+与 3a 仅两点差异：行向量用 `k·β` 而非 `q`；去掉对角线（严格因果 `j<i`）。
+Akk 是后续 K3 三角求解的对角输入，故对角块必须为 0（上三角块由 inter_solve 填补）。
+
+### 3c. 整块向量化：行/列因子拆分 + 两次大 dot（收敛 kernel 的写法）
+
+**数学变换：**
 
 ```
-Aqk[i, j] = <q[i],  k[j] * decay(i,j)> * scale
-Akk[i, j] = <k[i]·beta[i], k[j] * decay(i,j)>
-decay(i,j) = exp2(g[i] - g[j])
+exp2(g[i]−g[j]) = exp2(g[i]) · exp2(−g[j])          # 因子可分别预乘到行/列
+⇒ 一个窗口 16×16 块（或整 chunk 64×64，块外补 0 后数学不变）：
+   Aqk_full = ( qc⊙exp2(gc)·scale ) @ ( kc⊙exp2(−gc) )ᵀ     # [BT,K]@[K,BT]
+   Akk_full = ( kc⊙βc⊙exp2(gc) )    @ ( kc⊙exp2(−gc) )ᵀ
 ```
 
-- `Aqk` 含对角线（`j <= i`）；
-- `Akk` 严格上三角（`j < i`），对角线由 `tl.where(j < i_t, 1.0, 0.0)` 置零。
-
-### 3.4 存储布局
+**分块矩阵乘法图示**（一张 chunk 的 64×64 表；仅对角 4 个 16×16 块非零、块内下三角）：
 
 ```
-Aqk[bos*, i_t, i_h, j % BT]     -- 列 = j 在 chunk 内位置 (0..BT-1)
-Akk[bos*, i_t, i_h, j - i_ts]   -- 列 = sub-chunk 内偏移 (0..BC-1)
+       列 j → chunk 内 key 位置（0..63）
+ 行 i   ┌────────┬────────┬────────┬────────┐
+ 窗口0  │ ▣下三角 │    0   │    0   │    0   │
+        ├────────┼────────┼────────┼────────┤
+ 窗口1  │    0   │ ▣下三角 │    0   │    0   │
+        ├────────┼────────┼────────┼────────┤
+ 窗口2  │    0   │    0   │ ▣下三角 │    0   │
+        ├────────┼────────┼────────┼────────┤
+ 窗口3  │    0   │    0   │    0   │ ▣下三角 │
+        └────────┴────────┴────────┴────────┘
 ```
 
-对角线块外的列保持 0，由后续 inter_solve / chunk 级 kernel 填入。
+**逐 tile 分块代码：**
 
-### 3.5 尾 token / 尾 chunk 处理
+```
+# grid = (cdiv(T,BT), B·(H//HM))；每 CTA 循环 HM 个 head；BT=64、BC=16
+qc, kc, gc = load 整 chunk [BT, K]； betac = load [BT]          # 行/列两个打分共用
+eg   = exp2(gc);  ene = exp2(−gc)                                # 两因子各算一次
+Aqk_full = tl.dot( qc * eg * scale,  tl.trans(ke) )   # ke = kc*ene
+kbe      = (kc * betac[:, None]) * eg
+Akk_full = tl.dot( kbe,              tl.trans(ke) )
 
-- T 不是 BT 倍数时，最后一个 chunk 的尾 token 正常计算自己的区间；
-- `min(T, i_ts+BC)` 保证循环不越出真实 token 边界；
-- `mask = o_k < K` 保证 K 不是 2 的幂时，pad 通道不参与 dot 积。
+keep   = 对角块 ∧ (块内 r%BC ≥ c%BC)      # Aqk 下三角含对角
+strict = 对角块 ∧ (块内 r%BC >  c%BC)      # Akk 严格下三角
+Aqk_full = tl.where(keep,   Aqk_full, 0.0)
+Akk_full = tl.where(strict, Akk_full, 0.0)
+
+store Aqk + 行 offset + [0..BT)             # 无掩码连续写 [B,T,H,BT]
+Akk_diag = tl.gather(Akk_full, 对角线列偏移, axis=1)   # [BT,BC] 对角块收拢
+store Akk + 行 offset + [0..BC)             # 紧凑写 [B,T,H,BC]
+```
+
+**为何值置零而非 store-mask：** Ascend MTE 对非单调列地址的写会越界，Akk 紧凑列映射
+（`col = c−(r//16)*16`）不能直接无掩码写；故 Akk 先在整 chunk 宽度内算出、把对角块
+用 `tl.gather` 收拢成 `[BT,BC]` 再连续写，避免逐 lane 标量 store（aiv_scalar 头号瓶颈）。
+同理 Aqk 直接全宽写、非对角块写 0 —— 与 torch ref 的零初值一致，免去 buffer 预清零。
 
 ## 4. 关键代码对应（`src/token_parallel_kernel.py`）
 

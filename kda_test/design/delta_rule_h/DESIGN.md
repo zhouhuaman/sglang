@@ -76,158 +76,165 @@ i_h  = i_nh %  H       head 索引
 
 ## 3. 计算思路
 
-### 3.1 整体算法: Delta Rule 跨 Chunk 递推
+### 3.1 整体算法与收敛口径: 逐 chunk 递推（state 跨 chunk 串行）
 
-Delta Rule 的核心思想是: 用线性注意力近似, key-value 记忆通过外积不断累积到状态矩阵 h 中。
+Delta Rule 用线性注意力近似记忆: key-value 记忆经外积不断累积进状态矩阵 `state`,
+并带逐通道指数遗忘。**只有 chunk 顺序是串行依赖**; 一个 chunk 内 64 个 token、
+V 行、K 通道都可在寄存器/向量内并行。
 
-每个 chunk t 包含 BT=64 个连续 token。状态 h 在经过每个 chunk 后更新:
+> 口径注: 本目录 `src/delta_rule_h_kernel.py`（与 interview 版同一收敛实现）已收敛到
+> **整 K 单 tile**——state 寄存器 `b_h [BV, K]`（K≤256），driver 默认 `BV=V`（大 case
+> 整 V 驻留一个 CTA，实测较 BV=32 快 ~4×，见 OPTIMIZATION_LOG.md）。§2/§4/§5/§7 中
+> `BV=32`、K 维 4×64 展开（`b_h1..b_h4`）及对应行号仍是收敛前的并行口径，数学完全等价
+> （只是把 K 维展开并回成单 tile `b_h[BV,K]`）。以下 §3 计算按收敛 kernel 口径描述。
 
-```
-h[t] = h[t-1] * decay[t] + K[t]^T @ V_new[t]
-```
-
-其中:
-- `h[t]` 是第 t 个 chunk 结束时的状态矩阵, 形状为 `[V, K]`;
-- `decay[t]` 是第 t 个 chunk 结束时的遗忘因子: `exp2(gk_last[t])` (per-channel);
-- `V_new[t] = U[t] - W[t] @ h[t-1]^T` 是 Delta Rule 的核心: 残差 = 原值 - 历史预测;
-- `U[t]` 是 chunk t 中经 beta 和 Aqk 变换后的 value;
-- `W[t]` 是 chunk t 中经 beta 和 gate 衰减后的 key-stats;
-- `K[t]` 是 chunk t 中衰减后的 key (即输入 `k`/`kg`)。
-
-### 3.2 初始状态加载
+每个 chunk `i_t` 含 BT=64 个连续 token。进 chunk 先快照、算残差，再"旧记忆退场 + 写本
+chunk 新记忆"：
 
 ```
-initial_state 形状: [N, H, V, K]  (N = B, indices = arange(B))
-
-每个序列通过 initial_state_indices[B] 索引到它的状态池:
-  h0_ptr = initial_state + initial_state_indices[i_n] * (H * V * K) + i_h * V * K
-
-加载当前 V-tile [i_v*BV : (i_v+1)*BV, :] 到 b_h1 ~ b_h4 (4 个 K-tile):
-  b_h1 = h0[i_v*BV : (i_v+1)*BV,    0 : 64 ]   ← K tile 0
-  b_h2 = h0[i_v*BV : (i_v+1)*BV,  64 : 128]   ← K tile 1 (if K > 64)
-  b_h3 = h0[i_v*BV : (i_v+1)*BV, 128 : 192]   ← K tile 2 (if K > 128)
-  b_h4 = h0[i_v*BV : (i_v+1)*BV, 192 : 256]   ← K tile 3 (if K > 192)
+for i_t in 0..NT-1:                     # CTA 内串行; tl.range(num_stages=NS) 软件流水
+    h[i_t]     = state                               # ① 快照（进 chunk 起始态, 未衰减）
+    v_new[i_t] = u[i_t] − W[i_t] @ stateᵀ            # ② 残差 = 真实 − 历史预测
+    state     *= exp2(gk_last[i_t])                  # ③ 遗忘: 整 chunk 一次（末 token gate）
+    state     += k[i_t]ᵀ @ v_new[i_t]                # ④ 写记忆: 残差外积累加
 ```
 
-### 3.3 Chunk 循环体
+- 输入均为 Kernel-4 产物: `u`=原始 value、`w`=解耦 key 权重、`k`(=kg)=时间对齐 key;
+- `gk_last[i_t]` = chunk 末有效 token 的逐通道累计 gate（[K]）;
+- 前两步用**未衰减**的进-chunk state；③ 让旧记忆按 gate 退场，④ 在退场**之后**叠加本
+  chunk 残差——本 chunk 新写的记忆不背本次衰减（§3.3/3.4 详解顺序原因）。
 
-主循环 `for i_t in range(NT)` 依次处理每个 chunk, CTA 内部串行。
-
-```
-for i_t = 0, 1, 2, ..., NT-1:
-
-    chunk t ──────────────────────────┐
-    │                                  │
-    │  ① 保存状态快照 h[i_t] = state   │
-    │  ② Delta Rule 计算 v_new         │
-    │  ③ per-channel gate 衰减         │
-    │  ④ 状态更新 h += kg^T @ v_new    │
-    └──────────────────────────────────┘
-         ↓
-    chunk t+1 使用更新后的 h
-```
-
-#### 步骤 1: 保存状态快照 `h[i_t] = state`
+state 寄存器装载（收敛 kernel，每 CTA 一个 (batch, head) × V-tile）:
 
 ```
-目的: 保存当前 chunk 开始时的状态到全局内存 h[B, NT, H, V, K]
-这样 Kernel-6 (output kernel) 在计算最终输出时可以直接读取 h[t-1]
-
-为什么用 flat 1D pointer store 而不是 block_ptr?
-  → triton-ascend 编译器 bug: block_ptr store 到 (V, K) 形状会损坏源寄存器
-  → 变通方案: reshape 成 (BV*64,) 的一维 flat tensor, 用 1D store
-  (b_h1 + 0) 强制编译器用新鲜寄存器, 防止污染
+i_v, i_nh = program_id(0), program_id(1);  i_n, i_h = i_nh // H, i_nh % H
+h0 = initial_state + initial_state_indices[i_n] * (H*V*K) + i_h * V*K
+b_h = tl.zeros([BV, K], fp32)                      # 整 K 单 tile 状态
+b_h += tl.load(block_ptr(h0, (V,K), (K,1), (i_v*BV, 0), (BV,K), (1,0)))   # 无 boundary_check
 ```
 
-#### 步骤 2: Delta Rule 计算 `v_new = u - w @ h[t-1]^T`
+### 3.2 残差计算（Delta Rule 核心）: `v_new = u − W @ stateᵀ`
+
+**数学公式：**
 
 ```
-Delta Rule 核心:
-  v_new[t] = u[t] - W[t] @ h[t-1]^T
-
-其中:
-  - u[t]: chunk t 的原始 value     → [BT, V]
-  - W[t]: chunk t 的 w 矩阵         → [BT, K]
-  - h[t-1]: 上一 chunk 结束时的状态 → [V, K]
-  - h[t-1]^T: 状态的转置            → [K, V]
-  - W[t] @ h[t-1]^T: 历史预测       → [BT, V]
-  - v_new[t]: 残差 (误差)            → [BT, V]
-
-分块计算 (K 维度分 4 个 64 宽的 tile):
-  b_v = 0  (初始化为 0)
-  b_v += W_tile1 [BT, 64]  @  h1^T [64, BV]   ← K-tile 0
-  b_v += W_tile2 [BT, 64]  @  h2^T [64, BV]   ← K-tile 1 (if K > 64)
-  b_v += W_tile3 [BT, 64]  @  h3^T [64, BV]   ← K-tile 2 (if K > 128)
-  b_v += W_tile4 [BT, 64]  @  h4^T [64, BV]   ← K-tile 3 (if K > 192)
-
-  b_v = u[t] - b_v    ← 残差 = 原始值 - 历史预测
-  (代码中 p_v 加载的是 u[t], 然后减去预测得到 v_new[t])
+对 chunk 内第 i 个 token（预测权重行 W[i]）、value 第 v 维:
+  pred[i,v]  = Σ_κ  W[i,κ] · state[v,κ]      # state 第 v 行当系数，读记忆做预测
+  v_new[i,v] = u[i,v] − pred[i,v]
+整块 = u − W @ stateᵀ    （[BT,K] @ [K,V] → [BT,V]）
 ```
 
-#### 步骤 3: 保存 v_new
+**分块矩阵乘法图示：**
 
 ```
-SAVE_NEW_VALUE=True: 把 v_new 存到 v_new[B, T, H, V], 供 Kernel-6 output 使用
-  tl.store(p_v_new, b_v.to(p_v_new.dtype.element_ty), boundary_check=(0, 1))
+ W_chunk [BT, K]          stateᵀ [K, V]          pred = W @ stateᵀ   [BT, V]
++---------------------+   +--------------------+   +----------------------+
+| w_0: ——— K 通道 ———  |   | 转置: 第 v 列 =      |   | pred_0（用记忆预测）  |
+| w_1: ——— ——— ———     |   | state 第 v 行;       | @ | pred_1                |
+| ...                 | @ | 第 κ 行 = 第 κ 通道  | = | ...                  |
+| w_{BT-1}: ——— ———    |   |                    |   | pred_{BT-1}           |
++---------------------+   +--------------------+   +----------------------+
+  每行 = 一个 token 的预测权重     记忆只读（未衰减快照）     v_new = u − pred
 ```
 
-#### 步骤 4: Per-Channel Gate 衰减 (USE_GK + USE_EXP2)
+**逐 tile 分块代码（每 chunk 一次 [BT,K]@[K,BV] dot，含 ①② 快照/残差 store 标注）:**
 
 ```
-USE_GK: 逐 token / 逐 channel gate (log2 空间, 已 chunk-local cumsum)
-
-加载 gk_last (chunk 末尾的 gk):
-  b_gk_last1 = gk[last_idx, 0:64]     ← [64], K-tile 0 的末尾 gate
-  b_gk_last2 = gk[last_idx, 64:128]   ← [64], K-tile 1 的末尾 gate
-  ...
-
-应用 gate (采用 exp2):
-  b_h1 *= exp2(b_gk_last1)[None, :]   ← [64] 广播到 [BV, 64]
-  b_h2 *= exp2(b_gk_last2)[None, :]
-  ...
-
-含义:
-  每个 K channel 有独立的衰减因子 exp2(gk_last)。
-  这允许模型对不同维度的 key 信息有不同的保留时间。
-  信息衰减快的 channel 很快被遗忘, 衰减慢的 channel 长期保留。
+for i_t in tl.range(NT, num_stages=NS):
+    store h[i_t] = b_h                              # ① 快照（见 §3.5 的 store 写法）
+    p_w = block_ptr(w, (T,K), (stride_w,1), (i_t*BT,0), (BT,K), (1,0));  b_w = load(p_w)
+    b_v = tl.dot(b_w, tl.trans(b_h))                # [BT,K]@[K,BV] → [BT,BV]  预测
+    p_u = block_ptr(u, (T,V), (stride_v,1), (i_t*BT, i_v*BV), (BT,BV), (1,0))
+    b_v = load(p_u, boundary_check=(0,)) − b_v      # 残差 = 真实 − 预测
+    store v_new[i_t] = b_v                          # 供 Kernel-6 读取
+    # ③④ 在同一循环内接续（见 §3.3/3.4）
 ```
 
-#### 步骤 5: 状态更新 `h += kg^T @ v_new`
+### 3.3 Per-Channel Gate 遗忘: `state ← state ⊙ exp2(gk_last)`
+
+**数学公式：**
 
 ```
-状态更新 (外积累加):
-  h_new = h_decayed + K[t]^T @ v_new[t]
-
-矩阵维度:
-  - K[t]   → [K, BT]   (key 矩阵, 行为 K, 列为 BT tokens)
-  - v_new  → [BT, BV]  (chunk t 的 v_new, V 维度的当前 tile)
-  - h_new  → [BV, K]   (当前状态, V-tile x K-tile)
-
-分块计算:
-  使用 tl.dot(b_k, b_v) 然后转置:
-  b_h1 += tl.trans(tl.dot(b_k1, b_v))   ← b_k1 [64, BT] @ b_v [BT, BV] → [64, BV] → trans → [BV, 64]
-  b_h2 += tl.trans(tl.dot(b_k2, b_v))
-  b_h3 += tl.trans(tl.dot(b_k3, b_v))
-  b_h4 += tl.trans(tl.dot(b_k4, b_v))
-
-  注意: k = kg = k * beta * exp2(gk_last - gk) (已由 Kernel-4 计算好)
+state[v,κ] ← state[v,κ] · exp2(gk_last[κ])      # gk_last = chunk 末 token 的 gk（[K]）
 ```
 
-### 3.4 Epilogue: 最终状态写回 (INPLACE_UPDATE=True)
+`gk` 已 chunk-local cumsum（log2 空间），故 64 个 token 不必逐 token 乘，**整 chunk 只在
+边界乘一次**、用末 token 的 `gk_last`，把 state 从"进 chunk"推进到"出 chunk"时刻。
+
+**逐列缩放图示（每个 K 通道独立衰减率；[V,K] 各列乘各自标量）：**
 
 ```
-序列处理完所有 NT 个 chunk 后, 最终状态 ht 写回 initial_state (in-place):
-
-  initial_state[initial_state_indices[i_n], i_h, i_v*BV:(i_v+1)*BV, :] = final_h
-
-使用 flat 1D store (与 snapshot 相同的 triton-ascend bug 规避方案):
-  p_ht = ht + i_v * BV * K + offset_k + tl.arange(0, BV * 64)
-  tl.store(p_ht, b_h_flat.to(ht.dtype.element_ty))
-
-目的: 为下一个 batch 提供正确的初始状态 (KV Cache 管理)。
+ gk_last [K] = [a_0 a_1 … a_{K-1}] → 衰减率 e_κ = exp2(a_κ)
++-------------------------------+      +-------------------------------+
+| st[0,0] st[0,1] … st[0,K-1]   |      | st[0,0]·e_0  st[0,1]·e_1  …  |
+| st[1,0] st[1,1] … st[1,K-1]   |  ⇒   | st[1,0]·e_0  st[1,1]·e_1  …  |
+| …                             |      | …                            |
+| st[V,0] …        st[V,K-1]    |      | st[V,K-1]·e_{K-1}           |
++-------------------------------+      +-------------------------------+
 ```
 
-### 3.5 为什么 state 需要衰减 (遗忘机制)
+**逐 tile 分块代码：**
+
+```
+last = min((i_t+1)*BT, T) − 1                    # chunk 末有效 token
+b_gn = tl.load(gk + (bos+last)*H*K + i_h*K + offs_k)   # [K] 无 mask（K≥64 恒入界）
+b_h *= _exp2(b_gn)[None, :]                      # [1,K] 广播到 [BV,K] 逐列乘
+```
+
+**为何在 3.2 之后、3.4 之前乘：** 3.2 用未衰减快照预测残差（预测才反映"此刻该记得什么"）；
+③ 让**旧**记忆按 gate 退场，本 chunk 新写的残差在退场**之后**才叠加（3.4），故新记忆不背
+本次衰减——delta rule "本 chunk 修正"语义所在。
+
+### 3.4 状态更新（外积累加写记忆）: `state ← state + kᵀ @ v_new`
+
+**数学公式：**
+
+```
+state[v,κ] ← state[v,κ] + Σ_i  v_new[i,v] · k[i,κ]
+整块 = state + k_chunkᵀ @ v_new      （[K,BT] @ [BT,V] → [K,V]，转置后 [V,K] 累加）
+```
+
+**分块矩阵乘法图示：**
+
+```
+ v_newᵀ [V, BT]           k_chunk [BT, K]        Δstate = v_newᵀ@k  [V, K]
++---------------------+   +---------------------+   +---------------------+
+| v_new 第 0 列转成行  |   | k_0: ——— K 通道 ———  |   | 每元 = Σ_i v_new[i,v] |
+| v_new 第 1 列转成行  |   | k_1: ——— ——— ———     | @ |        · k[i,κ]      |
+| …（每行 = value 第  |   | …                   | = |  外积累加到 state     |
+|   v 维跨 BT token）  |   | k_{BT-1}: ——— ———    |   |                      |
++---------------------+   +---------------------+   +---------------------+
+```
+
+**逐 tile 分块代码（kernel 把 k 按转置布局载成 [K,BT]，一次 dot 免双转置）：**
+
+```
+p_k = block_ptr(k, (K,T), (1,stride_k), (0, i_t*BT), (K,BT), (0,1))    # 转置视图
+b_k = load(p_k, boundary_check=(1,));   b_v = b_v.to(b_k.dtype)
+b_h += tl.trans(tl.dot(b_k, b_v))        # [K,BT]@[BT,BV] → [K,BV] →ᵀ→ [BV,K] 累加
+```
+
+注意: `k` = `kg` = `k * beta * exp2(gk_last − gk)`（Kernel-4 已算好），即每行 key 已对齐到
+chunk 末时间戳，与 ③ 的衰减口径一致——累加后再递推到下一 chunk 正好续上时间轴。
+
+### 3.5 快照保存与终态写回（snapshot / epilogue, INPLACE_UPDATE=True）
+
+```
+目的: h[i_t] 记录第 i_t 个 chunk 开始（未衰减、未更新）的 state，Kernel-6 直接读它当
+本 chunk 的起始记忆; NT 个 chunk 跑完后把最终 state 写回 initial_state（in-place,
+下个 batch 用）。
+
+triton-ascend 编译器 bug 规避（勿改回）:
+  block_ptr store 到 (V, K) 形状会损坏源寄存器 → K=64 用 flat 1D store:
+      b_h_flat = tl.reshape(b_h + zeros([BV,64]), (BV*64,))
+      tl.store(base + chunk_off + v_start*64 + arange(0, BV*64), b_h_flat)
+  K≠64 用通用 2D 手动指针（offs_v[:,None]*K + offs_k[None,:]），勿用 flat reshape。
+
+尾 chunk（T 非 BT 倍数）: last=min((i_t+1)*BT,T)−1 取到末有效 token; load 越界行补 0
+（boundary_check 或 mask），参考实现同样补 0 再裁。
+```
+
+### 3.6 为什么 state 需要衰减 (遗忘机制)
 
 ```
 State 衰减是线性注意力模型的核心机制:
@@ -251,7 +258,7 @@ Gate 设计 (本目录只保留 USE_GK + USE_EXP2 路径):
   (USE_G + natural exp 的组合被删除, 因为本项目不调用)
 ```
 
-### 3.6 为什么需要保存 h 快照 (供 Kernel-6 读取)
+### 3.7 为什么需要保存 h 快照 (供 Kernel-6 读取)
 
 ```
 Kernel-6 (chunk_gla_fwd_kernel_o) 是 output kernel, 计算:

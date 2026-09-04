@@ -84,50 +84,110 @@ for i_k in range(cdiv(K, BK)):
 
 ## 3. 计算思路
 
-Kernel 6 的核心计算可以概括为**两路相加**:
+Kernel 6 是 KDA 的收尾算子: 每个 token 的输出 = **跨块**（用自己的 query 读"本 chunk
+之前所有 chunk"的压缩状态）+ **块内**（对同 chunk 内 ≤ 自己的 token 做精确因果注意力）。
+两路各自只是一条矩阵乘，**没有跨 chunk 串行依赖**，(chunk, head) 完全并行。
+
+> 口径注: §2/§4/§7 与附录中的 `BK=32/BV=32/num_warps=1` 是早期配置; 本目录
+> `src/gla_output_kernel.py`（与 interview 版同一收敛实现）已收敛到
+> **`BK=min(K,128)`、`BV=128`、HM=16 头合并**（grid 第三维 `B·(H//HM)`，与 head 无关的
+> 因果 mask / 边界 mask / 偏移向量全部提升到头循环外——标量寻址削减，见
+> OPTIMIZATION_LOG.md 第五轮，目标 case 6.94→4.75ms）。目标 case K=V=128 →
+> `cdiv(K,BK)=1`，跨块即单条 `[64,128]@[128,128]` 大 dot。数学完全等价。
+
+总式（每个 CTA 把两路累进同一个 fp32 累加器再写回）:
 
 ```
-o[t] = o_cross[t] + o_intra[t]
+对 token t（chunk c、块内行 i）:
+  o[t] = ( q[t]·exp2(g[t])·scale ) @ h_cᵀ      # ① 跨块: 读 chunk 之前的压缩历史
+       + tril(A_c) 行 i @ v_new                # ② 块内: 同 chunk 内 j≤i 的精确注意力
+h_c = h[b,c,h] 是 K5 快照，只含 chunk c 之前的信息（天然 causal，无需掩码）;
+A_c = Aqk[b,tc:tc+BT,h] 是 K2/K3 块内打分（已带 scale），只需把 j>i 清 0。
 ```
 
-### 3.1 跨块部分: 从压缩状态 h 读取历史信息
+### 3.1 跨块部分: `o_cross = (q ⊙ exp2(g) · scale) @ h_cᵀ`
+
+**数学公式：**
 
 ```
-q_gated[BT, BK] = q[BT, BK] * scale * exp2(g[BT, BK])
-o_cross[BT, V]  = q_gated[BT, K] @ h[V, K]^T
+o_cross[i, v] = Σ_κ  q[i,κ] · exp2(g[i,κ]) · scale · h_c[v,κ]
+query 先按自己 token 的逐通道 gate 衰减、再乘 scale（≈ 自己"此刻"的强度），去点乘状态
+第 v 行 —— 读到"所有更早 chunk"的信息。h 实现 O(T_hist) → O(K·V) 的信息压缩。
 ```
 
-h 的物理含义: h 是 Kernel 5 输出的压缩状态快照，记录了该 chunk 开始前
-所有 token 的累积信息，实现 O(T_history) → O(K*V) 的信息压缩。
+gate 语义: `g` 越负（累计衰减越大）→ `exp2(g)` 越小 → 该通道历史信息衰减越多; `g≈0`
+→ `exp2(g)≈1` → 完整保留。
 
-Gate g 控制 "遗忘" 程度:
-- `g` 越负 (衰减越大) → `exp2(g)` 越小 → 历史 chunk 信息衰减得越多;
-- `g` 接近 0 → `exp2(g)` 接近 1 → 完整保留关键信息。
-
-### 3.2 块内部分: 精确 chunk 内因果注意力
+**分块矩阵乘法图示：**
 
 ```
-A_masked[BT, BT] = where(lower_triangular, Aqk, 0)
-o_intra[BT, BV]  = A_masked[BT, BT] @ v_new[BT, BV]
+ qg = q·exp2(g)·scale [BT, K]         h_cᵀ [K, V]          o_cross [BT, V]
++---------------------+   +--------------------+   +----------------------+
+| qg_0: ——— K 通道 ———  |   | 转置: 第 v 列 =      |   | o_cross_0            |
+| qg_1                 |   | state 第 v 行;       | @ | o_cross_1            |
+| ...                 | @ | 第 κ 行 = 第 κ 通道  | = | ...                  |
+| qg_{BT-1}            |   |                    |   | o_cross_{BT-1}       |
++---------------------+   +--------------------+   +----------------------+
+  行 i = 自己的 query（已 gate/scale）   记忆只读（chunk 之前的压缩历史）   [BT,V]
 ```
 
-`A` (Aqk) 是下三角因果矩阵: `A[i, j] = 0` 当 `j > i`。
-通过 `tl.where(m_s, b_A, 0.0)` 施加 mask, 确保 token i 不会看到未来的 token。
-
-### 3.3 两部分相加并写出
+**逐 tile 分块代码（BK=min(K,128)，目标 case 无 K 循环；每 CTA 循环 HM 个头）:**
 
 ```
-o[BT, BV] = o_cross[BT, BV] + o_intra[BT, BV]
+for hh in tl.range(HM):                        # head-merged 循环; b_o 每 head 清零
+    b_o  = tl.zeros([BT, BV], fp32)
+    b_q  = load q  [i_t*BT:(i_t+1)*BT, :]  ;  b_q = b_q * scale      # [BT,BK]
+    b_g  = load g  [i_t*BT:(i_t+1)*BT, :]                             # [BT,BK]
+    b_qg = b_q * tl.math.exp2(b_g)                                     # [BT,BK]
+    b_h  = load h  [i_tg, i_v*BV:(i_v+1)*BV, :]                        # [BV,BK]
+    b_o += tl.dot(b_qg, tl.trans(b_h))        # [BT,BK]@[K,BV] → [BT,BV]
 ```
 
-fp32 累加器 `b_o` 先累加 o_cross (K-loop)，再累加 o_intra (A @ v)，
-最后转回存储精度 (bf16/fp16) 写出。
+### 3.2 块内部分: `o_intra = tril(A_c) @ v_new`
+
+**数学公式：**
+
+```
+o_intra[i, v] = Σ_{j≤i} A_c[i, j] · v_new[j, v]      # 只加 j≤i（本 chunk 内的历史/自己）
+掩码 m_s[i,j] = (i ≥ j)：上三角 j>i 置 0。
+```
+
+**分块矩阵乘法图示：**
+
+```
+ tril(A_c) [BT, BT]          v_new_c [BT, V]         o_intra [BT, V]
++------------------------+   +--------------------+   +----------------------+
+| ▣ ▣                    |   | v_0: ——— V 通道 ———  |   | o_intra_0（行 i 只累加 |
+| ▣ ▣ ▣                  |   | v_1                 | @ |   j≤i 的 v_new）     |
+| ... 下三角含对角 ▣      |   | ...                 | = | ...                  |
+| ▣ ▣ ... ▣              |   | v_{BT-1}            |   | o_intra_{BT-1}      |
++------------------------+   +--------------------+   +----------------------+
+  行 i 只保留列 j≤i（因果）        块内每个 token 的修正 value          [BT,V]
+```
+
+**逐 tile 分块代码：**
+
+```
+    b_A = load A [i_t*BT:(i_t+1)*BT, :BT]                     # [BT,BT] 打分
+    b_A = tl.where(m_s, b_A, 0.0)                             # 因果 mask 提前乘进 A
+    b_v = load v_new [i_t*BT:(i_t+1)*BT, i_v*BV:(i_v+1)*BV]   # [BT,BV]
+    b_o += tl.dot(b_A, b_v)                                   # [BT,BT]@[BT,BV] → [BT,BV]
+```
+
+### 3.3 相加与写回
+
+```
+store o [i_t*BT:(i_t+1)*BT, i_v*BV:(i_v+1)*BV] = b_o          # 两路已在累加器相加
+```
+
+fp32 累加器 `b_o` 先累 ① 跨块、再累 ② 块内，最后一次性 cast 到输出 dtype（目标 case
+fp32）写回——不产生 `qg` / `o_cross` 中间张量落盘。
 
 ### 3.4 尾 chunk / 尾 V-tile 处理
 
-最后一个 chunk 的行数可能不足 BT，最后一个 V-tile 可能不足 BV。kernel
-统一用 `boundary_check` 处理: 越界元素 load 为 0；`tl.where(m_s, b_A, 0.0)`
-施加因果 mask 后，越界行的 `b_A` 也被清零，因此不会污染累加器。
+最后一个 chunk 的行数可能不足 BT、最后一个 V-tile 可能不足 BV。kernel 用行/列
+`mask`（手动指针算术版）处理: 越界元素 load 为 0；`tl.where(m_s, b_A, 0.0)` 施加因果
+mask 后，越界行的 `b_A` 也被清零，因此不会污染累加器（参考实现同样补 0 再裁）。
 
 ---
 

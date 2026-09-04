@@ -57,69 +57,93 @@ i_h  = i_bh %  H       head 索引
 
 ## 3. 计算思路
 
-### 3.1 总体数据流
+> 目标：每个 token 的逐通道累积衰减 `gk`（log2 空间）。它是一条 **激活 → chunk 局部
+> 前缀和 → 缩放** 的逐元素流水线；同一个 (b,h) 的相邻通道/相邻时间完全独立，因此
+> kernel 把它铺成二维 tile（行 = chunk 内时间、列 = 通道块）一次向量化做完。
+
+### 3a. gate 的计算（逐元素激活）：`gate[t,k] = -exp(A_log[h]) * softplus(x[t,k] + dt_bias[h,k])`
+
+**数学公式：**
 
 ```
-raw_gate [B,T,H,K]  +  A_log [H]  +  dt_bias [H*K] (可选)
-            |               |              |
-            v               v              v
-    ┌───────────────────────────────────────────┐
-    │ Step 1: 门控激活 (Gate Activation)         │
-    │   tile [BT, BS]： -exp(A_log) * softplus(..)│
-    └───────────────────────────────────────────┘
-                         |
-                         v
-    ┌───────────────────────────────────────────┐
-    │ Step 2: Chunk 内累积求和 (Cumsum)          │
-    │   tl.cumsum(b_gate, axis=0)               │
-    │   每个 chunk 独立，跨 chunk 边界不传递       │
-    └───────────────────────────────────────────┘
-                         |
-                         v
-    ┌───────────────────────────────────────────┐
-    │ Step 3: 缩放 + log2 转换                   │
-    │   b_o *= RCP_LN2  (= 1.442695...)         │
-    └───────────────────────────────────────────┘
-                         |
-                         v
-              output [B,T,H,K] dtype=fp32
+gate[t, k] = -exp(A_log[h]) * softplus(x[t, k] + dt_bias[h*K+k])
+softplus(u) = log(1 + exp(u))，u ≥ 20 时取 u（防 exp 溢出）
 ```
 
-### 3.2 Standard Gate 激活
+逐元素含义：
+- `dt_bias[h*K+k]` 每个 (head,通道) 一个偏置 → 使 gate 的"零点"逐通道可调；
+- `softplus` 保证括号内为正；`A_log[h]` 每 head 一个尺度，控制整 head 衰减强度；
+- **负号** ⇒ gate 恒为负 ⇒ 前缀和后 gk 单调递减，衰减随 token 数加深。
+
+**Tile 布局示意**（本算子无矩阵乘；kernel 把"一条 (b,h,通道块) 的 64 步前缀和"
+向量化成 [BT 行时间 × BS 列通道] 的二维 tile）：
 
 ```
-gate[t, k] = -exp(A_log[h]) * softplus(x[t, k] + dt_bias[h, k])
-softplus(x) = log(1 + exp(x))，x >= 20 时线性近似为 x（防 exp 溢出）
+ 一个 CTA 处理的时间 chunk c（首 token tc=c*BT）           列 = 一个通道块 S-tile
+        ┌───────────────────────────────────────┐        BS = 128（真 kernel 常量）
+ 行 t0   │  x[t0, s0]  x[t0, s0+1] ... x[t0,s0+BS-1]│ ──┐
+ 行 t0+1 │  x[t0+1, s0]           ...              │   │ +dt_bias[h, s0..s0+BS]（按列）
+ 行 t0+2 │  ...                                    │   │ softplus
+  ...    │                                        │   │ ×(-exp(A_log[h]))（按行标量）
+ 行 t0+63│  x[t0+63, s0]          ...              │ ──┘
+        └───────────────────────────────────────┘      → gate[BT, BS]
+grid = (cdiv(K,BS), NT, B*H) ：program(0)=S-tile，(1)=chunk，(2)=(b,h)
 ```
 
-含义：
-- `A_log[h]` 控制该 head 的整体衰减强度；
-- softplus 保证 gate 恒为正，负号使 gate 为负 → 后续 `exp2(gate) ∈ (0,1]` 作为衰减因子；
-- 这是 KDA Delta Rule 的 chunk-wise 衰减门控。
-
-### 3.3 Chunk 内累计求和
+**逐 tile 分块代码：**
 
 ```
-b_o = tl.cumsum(b_gate, axis=0)   # axis=0 为 chunk 的时间维
+i_s, i_t, i_bh = tl.program_id(0..2)          # (通道块, chunk, batch*head)
+b_s   = load(x + 偏移(tc..tc+63, s0..s0+BS-1))   # [BT, BS]  raw gate
+b_s  += load(dt_bias + h*K + s0..s0+BS-1)[None, :]  # 加偏置，按列广播
+b_a   = load(A_log + h)                        # 每 head 一个标量
+b_gate = -tl.exp(b_a) * _softplus(b_s)         # [BT, BS]  gate 激活
+b_gate = tl.where(行末越界, 0.0, b_gate)        # 尾 chunk 无效行清零（见 3b）
 ```
 
-- 每个 chunk 独立做前缀和，**跨 chunk 边界不传递**（chunk N 的首元素 = `gate[N*BT]`）；
-- 因此每个 chunk 可与它自身时间窗内的 attention 计算独立并行。
+### 3b. gk 的计算（chunk 局部前缀和）：`gk[t,k] = cumsum_{chunk 内}(gate)[t,k]`
 
-### 3.4 Log2 空间转换
+**数学公式：**
 
 ```
-b_o *= scale   # scale = RCP_LN2 = 1/ln2 = 1.4426950216293335
+对 chunk c（首 token tc = c*BT）与通道 k：
+  gk[tc+i, k] = gate[tc, k] + gate[tc+1, k] + ... + gate[tc+i, k]     (i = 0..BT-1)
+
+跨 chunk 不传递：每个 chunk 从 0 重新开始（chunk N 首行 = gate[N*BT]，不带上个 chunk 的累计）。
 ```
 
-把 ln 空间的 gate 转到 log2 空间，后续 chunk kernel 用 `exp2` 而非 `exp`，硬件上更高效。
+> 前缀和逐通道独立、逐 chunk 独立，因此没有跨 chunk / 跨通道的任何串行依赖 —— 每个 CTA
+> 只需要自己那一块 [BT, BS]，这也是能一步 `tl.cumsum(axis=0)` 的原因。
 
-### 3.5 尾 chunk / 尾 S-tile 的处理
+**逐 tile 分块代码（复用 3a 的 tile，沿时间轴一步完成）：**
 
-最后一个 chunk 的行数可能不足 `BT`，最后一个 S-tile 可能不足 `BS`。kernel 统一用
-mask 处理：越界元素 load 为 0，并且在做 `tl.cumsum` **前**把无效行清零
-（`tl.where(masks, b_gate, 0.0)`）。因为 `tl.cumsum` 沿 axis=0 向后累加，
-**尾部补零不会污染头部有效行的前缀和**，与真实 kernel 中 `boundary_check` 返回 0 的行为一致。
+```
+b_gk = tl.cumsum(b_gate, axis=0)    # axis=0 = chunk 时间维 → [BT, BS] 前缀和
+```
+
+**尾 chunk 为何安全：** `tl.cumsum` 沿 axis=0 向后累加。3a 里把越界行清零，
+补零只会出现在段尾，`0` 加到有效行的前缀和上不改变结果 —— 恰好等于真 kernel
+`boundary_check` 返回 0 的行为，无需分支。
+
+### 3c. log2 空间换算：`gk ← gk * scale`
+
+**数学公式：**
+
+```
+gk[t,k] ← gk[t,k] * RCP_LN2          # RCP_LN2 = 1/ln2 = 1.4426950216293335
+```
+
+把 ln 空间的累计 gate 换到 log2 空间：下游 K4/K5/K6 全部用 `exp2(gk)`（而非 `exp`），
+省一次换底，且硬件 exp2 比 exp 便宜 —— 这条乘法是刻意留在本 kernel 里的。
+
+**逐 tile 分块代码：**
+
+```
+b_gk *= scale                         # 常量乘，仍在 [BT, BS] tile 上
+store(gk + 同 tile 地址, b_gk)        # 写回 [B,T,H,K]
+```
+
+> 尾 chunk / 尾 S-tile 的越界列本就被清零，越界行在 3a 清零；写回同 mask，不产生脏数据。
 
 ## 4. 关键代码对应（`src/gate_kernel.py`）
 

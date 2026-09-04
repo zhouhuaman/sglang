@@ -89,67 +89,96 @@ k [B,T,H,K]  v [B,T,H,V]  beta [B,T,H]  A=Akk_inv [B,T,H,BT]  gk [B,T,H,K]
                                       └──────────────────────────────────┘
 ```
 
-### 3.2 w 的计算: `A_inv @ (k * beta * exp2(gk))`
+### 3.2 w 的计算: `w = A_inv @ (k ⊙ β ⊙ exp2(gk))`
 
 **数学公式:**
 
 ```
-w_i = sum_j A_inv(i, j) * k_j * beta_j * exp2(gk_j)
+w[i] = Σ_j A_inv(i, j) · k[j] · β[j] · exp2(gk[j])      （i,j = chunk 内 0..BT-1）
 ```
 
-逐 K-tile（BK=32）分块:
+行输入先做**逐元素缩放**（`k*β`，再 `*exp2(gk)`），再乘 A_inv 解耦。
+
+**分块矩阵乘法图示:**
 
 ```
-for i_k in range(cdiv(K, BK)):
-    k_tile  = load [BT, BK]
-    gk_tile = load [BT, BK]
-    k_scaled = k_tile * beta[:, None]    # [BT, BK] * [BT, 1]
-    k_scaled *= exp2(gk_tile)            # gate 调制
-    w_tile = tl.dot(A_inv, k_scaled)      # [BT, BT] @ [BT, BK] -> [BT, BK]
-    store w_tile
+ 缩放后的输入 [BT, K]            A_inv [BT, BT]            输出 w [BT, K]
++---------------------------+   +------------------------+   +---------------------------+
+| k_0·β_0·exp2(gk_0)        |   | A00  A01 ... A0,BT     |   | w_0                       |
+| k_1·β_1·exp2(gk_1)        |   | A10  A11 ... A1,BT     |   | w_1                       |
+| ...                       |   | ...                    | @ | ...                       |
+| k_{BT-1}·β·exp2(gk_{BT-1}) |   | ABT0  ...  ABT,BT      |   | w_{BT-1}                  |
++---------------------------+   +------------------------+   +---------------------------+
+             逐元素缩放                        [BT, BT]                 K dim
 ```
 
-### 3.3 u 的计算: `A_inv @ (v * beta)`
+**逐 tile 分块代码（收敛 kernel：K 单 tile 直通，目标 case BK=K=128）：**
+
+```
+# grid = (NT, B·H//HM)；每 CTA 循环 HM 个头；BT=64
+b_A  = load A_inv [BT, BT]                        # 单位下三角逆，每 head 一次
+b_b  = load beta [BT]
+b_k  = load k    [BT, K]
+b_gk = load gk   [BT, K]
+b_kb = b_k * b_b[:, None] * exp2(b_gk)            # [BT, K]  gate 调制
+b_w  = tl.dot(b_A, b_kb, input_precision="tf32")  # [BT,BT] @ [BT,K] -> [BT,K]
+store w [BT, K]
+```
+
+### 3.3 u 的计算: `u = A_inv @ (v ⊙ β)`
 
 **数学公式:**
 
 ```
-u_i = sum_j A_inv(i, j) * v_j * beta_j
+u[i] = Σ_j A_inv(i, j) · v[j] · β[j]
 ```
 
-逐 V-tile（BV=32）分块:
+**分块矩阵乘法图示:**
 
 ```
-for i_v in range(cdiv(V, BV)):
-    v_tile = load [BT, BV]
-    v_scaled = v_tile * beta[:, None]    # [BT, BV] * [BT, 1]
-    u_tile = tl.dot(A_inv, v_scaled)      # [BT, BT] @ [BT, BV] -> [BT, BV]
-    store u_tile
+ 缩放后的输入 [BT, V]            A_inv [BT, BT]            输出 u [BT, V]
++--------------------------+   +------------------------+   +-------------------------+
+| v_0·β_0                  |   | A00  A01 ... A0,BT     |   | u_0                     |
+| v_1·β_1                  |   | A10  A11 ... A1,BT     |   | u_1                     |
+| ...                      |   | ...                    | @ | ...                     |
+| v_{BT-1}·β_{BT-1}        |   | ABT0  ...  ABT,BT      |   | u_{BT-1}                |
++--------------------------+   +------------------------+   +-------------------------+
+             逐元素缩放                        [BT, BT]                 V dim
+```
+
+**逐 tile 分块代码（V 单 tile，目标 case BV=V=128）：**
+
+```
+b_v  = load v [BT, V]
+b_vb = b_v * b_b[:, None]                          # [BT, V]  只乘 β
+b_u  = tl.dot(b_A, b_vb, input_precision="tf32")   # [BT,BT] @ [BT,V] -> [BT,V]
+store u [BT, V]
 ```
 
 **注意：** u 计算没有 gk 调制，因为 Value 不受 Linear Attention 的 gate 影响。
 
-### 3.4 kg 的计算: `k * exp2(gk_last - gk)`
+### 3.4 kg 的计算: `kg = k ⊙ exp2(gk_last − gk)`
 
 **数学公式:**
 
 ```
-kg(i) = k_i * exp2(gk_last - gk_i)
+kg[i] = k[i] · exp2(gk_last − gk[i])       # gk_last = chunk 末有效 token 的 gk
 ```
 
-其中 `gk_last` 是 chunk 内最后一个有效 token 的 gk 值。物理含义：将 chunk 内
-每个 token 的 Key 从"各自时间戳"对齐到"chunk 末尾时间戳"。
+物理含义：把 chunk 内每个 token 的 Key 从"各自时间戳"对齐到"chunk 末尾时间戳"——供
+K5 状态递推时把不同行时间衰减到同一参考点后再相加。
+
+**逐 tile 分块代码（K 单 tile，复用 3.2 已载的 b_k / b_gk）：**
 
 ```
 if STORE_KG:
-    last_idx = min(i_t * BT + BT, T) - 1
-    o_k = i_k * BK + tl.arange(0, BK)
-    gk_last = load gk[last_idx, o_k]    # [BK] 向量
-    kg_tile = k_tile * exp2(gk_last - gk_tile)
-    store kg_tile
+    last_idx = min(base + BT, T) - 1                  # chunk 最后一个有效 token
+    b_gn = load gk[last_idx, :]                       # [K] chunk 末 gk
+    b_kg = b_k * exp2(b_gn[None, :] - b_gk)           # [BT, K] 逐元素
+    store kg [BT, K]
 ```
 
-**为何 kg 在 K 循环中而非独立循环：** 复用已加载的 k_tile 和 gk_tile，减少重复访存。
+**为何 kg 搭 w 一起算而非独立循环：** 复用 3.2 已加载的 `b_k` / `b_gk`，减少重复访存。
 
 ### 3.5 为什么需要 Akk_inv（chunk 内因果依赖解耦）
 
