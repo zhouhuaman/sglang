@@ -1,0 +1,8 @@
+# msprof 采集产物 / 测试与 bench 输出（GB 级或每次重跑，不入库）
+prof*/
+prof_*/
+correctness.csv
+results*.csv
+profile_meta*.json
+time_results.json
+__pycache__/

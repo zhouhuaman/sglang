@@ -1,0 +1,6 @@
+# bench 运行产物（可随时用 README/命令重新生成，不入库）
+prof*/
+results*.csv
+correctness*.csv
+__pycache__/
+*.pyc

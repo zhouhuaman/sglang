@@ -41,7 +41,7 @@ kernel 统一用 ``boundary_check`` 处理：越界元素 load 为 0，``tl.wher
 available" 错误）。真实运行环境由调用方在启动 python 前自行 source CANN 的
 ``set_env.sh`` 并设置 ``LD_LIBRARY_PATH``、
 ``TORCH_DEVICE_BACKEND_AUTOLOAD=0``。在无 NPU 设备的环境里也可以正常 import、
-并运行 ``gla_output_ref``；``gla_output_kernel`` 在检测不到 NPU 时会自动退化为
+并运行 ``turbo_gla_output_ref``；``turbo_gla_output_triton`` 在检测不到 NPU 时会自动退化为
 参考实现（便于纯 CPU 校验逻辑）。
 """
 
@@ -77,7 +77,7 @@ def _cdiv(a: int, b: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def gla_output_ref(
+def turbo_gla_output_ref(
     q,
     v_new,
     g,
@@ -155,7 +155,7 @@ def gla_output_ref(
 # ---------------------------------------------------------------------------
 
 
-def gla_output_torch(
+def turbo_gla_output_torch(
     q,
     v_new,
     g,
@@ -167,7 +167,7 @@ def gla_output_torch(
     """元算子 (torch_npu 算子图) 版本：与 triton kernel 数学完全一致。
 
     这是**性能基准**实现 —— 用 torch_npu 现成的逐算子组合完成同样的计算,
-    供与 triton kernel 做加速比对比。相比 ``gla_output_ref`` 的逐 chunk
+    供与 triton kernel 做加速比对比。相比 ``turbo_gla_output_ref`` 的逐 chunk
     循环，本实现把 chunk/head 维度全部向量化，用批量 ``matmul`` 一次完成:
 
       * ``q * exp2(g) * scale`` 逐元素；
@@ -175,7 +175,7 @@ def gla_output_torch(
       * ``A_masked = A * tril``，再 ``matmul(A_masked, v_new)``  批量 [BT,BT]@[BT,V]；
       * 两者相加，reshape 回 [B, T, H, V]。
 
-    参数与 ``gla_output_kernel`` 相同。返回 [B, T, H, V] fp32 (device 与输入一致)。
+    参数与 ``turbo_gla_output_triton`` 相同。返回 [B, T, H, V] fp32 (device 与输入一致)。
     """
     assert q.dim() == 4, f"q must be 4D [B,T,H,K], got shape {tuple(q.shape)}"
     assert h.dim() == 5, f"h must be 5D [B,NT,H,V,K], got shape {tuple(h.shape)}"
@@ -416,7 +416,7 @@ def chunk_gla_fwd_kernel_o_hm(
                  b_o.to(o.dtype.element_ty), mask=o_mask)
 
 
-def gla_output_kernel(
+def turbo_gla_output_triton(
     q,
     v_new,
     g,
@@ -446,7 +446,7 @@ def gla_output_kernel(
 
     # 纯 CPU / 无 NPU 环境：退化为参考实现
     if not hasattr(torch, "npu") or not torch.npu.is_available():
-        return gla_output_ref(q, v_new, g, Aqk, h, scale, chunk_size=chunk_size)
+        return turbo_gla_output_ref(q, v_new, g, Aqk, h, scale, chunk_size=chunk_size)
 
     B, T, H, K = q.shape
     V = v_new.shape[-1]

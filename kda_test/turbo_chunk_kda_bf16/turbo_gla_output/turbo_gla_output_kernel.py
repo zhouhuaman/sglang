@@ -6,6 +6,9 @@
 ``torch`` / ``triton``，**不 import 任何 sglang 代码**，因此可被本目录的
 测试驱动独立使用。
 
+bf16 改造(2026-09-09,基于 fp16 版转制;对齐 Ascend C bf16 口径):输入/输出 fp16;q·exp2(g) 衰减乘在 fp32
+做、两个 tl.dot 操作数 cast fp16、b_o fp32 累加器保留、store 前 cast fp16。
+
 计算内容（与上游 kernel 完全一致）::
 
     o[t] = o_cross[t] + o_intra[t]
@@ -41,7 +44,7 @@ kernel 统一用 ``boundary_check`` 处理：越界元素 load 为 0，``tl.wher
 available" 错误）。真实运行环境由调用方在启动 python 前自行 source CANN 的
 ``set_env.sh`` 并设置 ``LD_LIBRARY_PATH``、
 ``TORCH_DEVICE_BACKEND_AUTOLOAD=0``。在无 NPU 设备的环境里也可以正常 import、
-并运行 ``gla_output_ref``；``gla_output_kernel`` 在检测不到 NPU 时会自动退化为
+并运行 ``turbo_gla_output_ref``；``turbo_gla_output_triton`` 在检测不到 NPU 时会自动退化为
 参考实现（便于纯 CPU 校验逻辑）。
 """
 
@@ -77,7 +80,7 @@ def _cdiv(a: int, b: int) -> int:
 # ---------------------------------------------------------------------------
 
 
-def gla_output_ref(
+def turbo_gla_output_ref(
     q,
     v_new,
     g,
@@ -155,7 +158,7 @@ def gla_output_ref(
 # ---------------------------------------------------------------------------
 
 
-def gla_output_torch(
+def turbo_gla_output_torch(
     q,
     v_new,
     g,
@@ -167,7 +170,7 @@ def gla_output_torch(
     """元算子 (torch_npu 算子图) 版本：与 triton kernel 数学完全一致。
 
     这是**性能基准**实现 —— 用 torch_npu 现成的逐算子组合完成同样的计算,
-    供与 triton kernel 做加速比对比。相比 ``gla_output_ref`` 的逐 chunk
+    供与 triton kernel 做加速比对比。相比 ``turbo_gla_output_ref`` 的逐 chunk
     循环，本实现把 chunk/head 维度全部向量化，用批量 ``matmul`` 一次完成:
 
       * ``q * exp2(g) * scale`` 逐元素；
@@ -175,7 +178,7 @@ def gla_output_torch(
       * ``A_masked = A * tril``，再 ``matmul(A_masked, v_new)``  批量 [BT,BT]@[BT,V]；
       * 两者相加，reshape 回 [B, T, H, V]。
 
-    参数与 ``gla_output_kernel`` 相同。返回 [B, T, H, V] fp32 (device 与输入一致)。
+    参数与 ``turbo_gla_output_triton`` 相同。返回 [B, T, H, V] fp32 (device 与输入一致)。
     """
     assert q.dim() == 4, f"q must be 4D [B,T,H,K], got shape {tuple(q.shape)}"
     assert h.dim() == 5, f"h must be 5D [B,NT,H,V,K], got shape {tuple(h.shape)}"
@@ -300,11 +303,11 @@ def chunk_gla_fwd_kernel_o(
         q_mask = (i_t * BT + tl.arange(0, BT)[:, None] < T) & (i_k * BK + tl.arange(0, BK)[None, :] < K)
         b_q = tl.load(q + (bos * H + i_h) * K + i_t * BT * s_q_t + i_k * BK + q_offs,
                       mask=q_mask, other=0.0)
-        b_q = (b_q * scale).to(b_q.dtype)
+        b_q = b_q.to(tl.float32) * scale  # fp16 全局 load 后先转 fp32（scale/衰减乘在 fp32 域做）
 
         b_g = tl.load(g + (bos * H + i_h) * K + i_t * BT * s_q_t + i_k * BK + q_offs,
                       mask=q_mask, other=0.0)
-        b_qg = (b_q * tl.math.exp2(b_g)).to(b_q.dtype)
+        b_qg = (b_q * tl.math.exp2(b_g.to(tl.float32))).to(tl.bfloat16)  # 衰减乘 fp32 完成；dot 操作数 cast fp16
 
         # h tile: [BV, BK]  —  base = h[i_tg, i_h, 0, 0] + i_v*BV*s_h_v + i_k*BK
         h_offs = tl.arange(0, BV)[:, None] * s_h_v + tl.arange(0, BK)[None, :]
@@ -395,10 +398,10 @@ def chunk_gla_fwd_kernel_o_hm(
         # ── 跨块: q_gated @ h^T ──
         b_q = tl.load(q + (bos * H + i_h) * K + i_t * BT * s_q_t + q_offs,
                       mask=q_mask, other=0.0)
-        b_q = (b_q * scale).to(b_q.dtype)
+        b_q = b_q.to(tl.float32) * scale  # fp16 全局 load 后先转 fp32（scale/衰减乘在 fp32 域做）
         b_g = tl.load(g + (bos * H + i_h) * K + i_t * BT * s_q_t + q_offs,
                       mask=q_mask, other=0.0)
-        b_qg = (b_q * tl.math.exp2(b_g)).to(b_q.dtype)
+        b_qg = (b_q * tl.math.exp2(b_g.to(tl.float32))).to(tl.bfloat16)  # 衰减乘 fp32 完成；dot 操作数 cast fp16
         b_h = tl.load(h + (i_tg * H + i_h) * V * K + i_v * BV * s_h_v + h_offs,
                       mask=h_mask, other=0.0)
         b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
@@ -416,7 +419,7 @@ def chunk_gla_fwd_kernel_o_hm(
                  b_o.to(o.dtype.element_ty), mask=o_mask)
 
 
-def gla_output_kernel(
+def turbo_gla_output_triton(
     q,
     v_new,
     g,
@@ -430,7 +433,7 @@ def gla_output_kernel(
 
     参数与上游 ``chunk_gla_fwd_o_gk`` 兼容（去掉 VARLEN/chunk_indices 路径）:
 
-        q:     [B, T, H, K]    query 向量（bf16/fp16/fp32）
+        q:     [B, T, H, K]    query 向量（任意 dtype；进 kernel 前统一转 fp16）
         v_new: [B, T, H, V]   修正后的 value（Kernel 5 输出）
         g:     [B, T, H, K]   累积 gate（Kernel 1 输出，log2 空间）
         Aqk:   [B, T, H, BT]  chunk 内因果注意力权重
@@ -438,26 +441,35 @@ def gla_output_kernel(
         scale: float          注意力缩放因子 1/sqrt(K)
 
     返回:
-        [B, T, H, V] 结果，dtype 与 q 一致（bf16/fp16），位于 NPU 上。
-        NPU 不可用时自动退化为 CPU 参考（fp32）。
+        [B, T, H, V] fp16 结果（2026-09-09 fp16 改造后固定输出 fp16），位于 NPU 上；
+        无 NPU 时自动退化为 CPU 参考实现（返回 fp32）。
     """
     assert q.dim() == 4, f"q must be 4D [B,T,H,K], got shape {tuple(q.shape)}"
     assert h.dim() == 5, f"h must be 5D [B,NT,H,V,K], got shape {tuple(h.shape)}"
 
     # 纯 CPU / 无 NPU 环境：退化为参考实现
     if not hasattr(torch, "npu") or not torch.npu.is_available():
-        return gla_output_ref(q, v_new, g, Aqk, h, scale, chunk_size=chunk_size)
+        return turbo_gla_output_ref(q, v_new, g, Aqk, h, scale, chunk_size=chunk_size)
 
     B, T, H, K = q.shape
     V = v_new.shape[-1]
     BT = int(chunk_size)
     NT = _cdiv(T, BT)
 
+    # 输入统一转 fp16（K6 对齐 Ascend C 的 fp16 形态；已是 fp16 则 .to 为 no-op）。
+    # CPU 参考退化路径已在上方提前返回、不受影响（参考保持原 dtype 全 fp32 精度）。
+    q = q.to(torch.bfloat16)
+    v_new = v_new.to(torch.bfloat16)
+    g = g.to(torch.bfloat16)
+    Aqk = Aqk.to(torch.bfloat16)
+    h = h.to(torch.bfloat16)
+
     # h 的 batch 维需展平为 [B*NT, H, V, K] 以匹配 kernel 的索引方式
     # (kernel 用 i_tg = i_b * NT + i_t 作为第一维索引)
     h_flat = h.reshape(B * NT, H, V, K).contiguous()
 
-    # 输出 tensor（与 q 同 dtype，默认 bf16）
+    # 输出 tensor：fp16（输入已统一转 fp16，故默认 dtype 即 fp16；调用方显式
+    # 传 out_dtype 时仍跟随调用方）
     if out_dtype is None:
         out_dtype = q.dtype
     o = torch.empty(B, T, H, V, dtype=out_dtype, device=q.device)
