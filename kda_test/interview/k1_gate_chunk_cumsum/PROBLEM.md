@@ -98,4 +98,33 @@ msprof --output=./prof_k1 --application="python3 test.py --perf --repeats 7 --wa
     && python3 test.py --report ./prof_k1        # ② 基线（msprof Task Duration 每调用均值）
 ```
 
-官方基线 ≈ **1.96 ms/调用**（±10%）；门槛 `max_diff < 1e-2`。
+官方基线 ≈ **1.37 ms/调用**（±10%，2026-09-07 本机 triton-ascend 3.2.1 msprof 实测口径）；
+门槛 `max_diff < 1e-2`。
+
+## 5. 设计创新点与深度解析
+
+> 本节复盘**基线 kernel 的设计决策链**（数字为迭代环境实测，量级参考；随工具链/机型
+> 漂移）。K1 无矩阵乘，其优化主线与其余五个完全不同：纯访存形态 + chunk 前缀和指令。
+
+- 【并行度建模】算子 = 逐元素激活 + 沿时间维的 **chunk 局部**前缀和。把三维并行度
+  （通道块 × chunk × B·H）显式铺成 grid，而非把整段 [T,K] 交给一个大 kernel —— 前缀和
+  在 chunk 内串行、跨 chunk 与跨通道全并行，切到 chunk 粒度才能与 K2..K6 共享同一套
+  BT=64 边界。
+- 【硬件约束识别：grid 展平上限】triton-ascend 把 3D grid 展平成 1D 后，总 CTA 数不能
+  超过 65535（超限直接启动失败 `ERR00100`）。BS=32 时目标 case 展平 98304 超限 →
+  通道维放大到 BS=128（K 不切），grid 降到 24576、每 CTA 密度翻倍（R2 ≈1.85ms）——
+  "通道怎么切"首先是被 CTA 上限逼出来的，其次才是 UB 容量。
+- 【尾 chunk 补零安全性论证（免掩码的关键）】`tl.cumsum` 沿时间轴**单向**累加 ⇒ 越界行
+  清零后，补零只出现在段尾、不会污染头部有效行的前缀和 ⇒ 整个 kernel 不需要
+  boundary_check 的 if 分支、store 不加 mask。这是"用数学性质换代码形态"的典型，
+  与 K2 的 exp2 拆分、K3 的截断逆同族。
+- 【跨算子协同：log2 空间换算】把 `scale = RCP_LN2` 刻意放在本 kernel 尾乘，将 gate 从
+  ln 空间换算到 log2 空间 —— 下游 K2/K3/K6 的 `exp2(g[i]-g[j])` 才能直接当底，硬件
+  exp2 比 exp 便宜，K4/K5 的 per-channel 衰减也省一次换底。一个常量放对位置 = 全链
+  省一类指令。
+- 【UB 预算实测】BT=128×BS=128 的 fp32 tile 直接报 `ub overflow: 2625536 bits >
+  1572864 bits` —— 用编译器报错反推出片上 UB 可用预算，"尽量放大 tile"因此有了硬上界
+  （128×128 fp32 = 64KB 级别即撞 UB），tile 形状不是拍脑袋选的。
+- 【数值契约】`gate = −exp(A_log)·softplus(x+bias)` 恒负 ⇒ `gk` 单调递减（衰减随 token
+  加深），这是下游语义的一部分；softplus 在 v≥20 退化为 v 防溢出 —— 数值稳定性解决在
+  公式层，kernel 层只负责把它算对。

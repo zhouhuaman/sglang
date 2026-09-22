@@ -109,4 +109,32 @@ msprof --output=./prof_k3 --application="python3 test.py --perf --repeats 7 --wa
     && python3 test.py --report ./prof_k3        # ② 基线（msprof Task Duration 每调用均值）
 ```
 
-官方基线 ≈ **14.4–14.9 ms/调用**（±10%）；门槛 `max_diff < 1e-2`。
+官方基线 ≈ **10.70 ms/调用**（±10%，2026-09-07 本机 triton-ascend 3.2.1 msprof 实测口径）；
+门槛 `max_diff < 1e-2`。
+
+## 5. 设计创新点与深度解析
+
+> 本节复盘**基线 kernel 的设计决策链**（数字为迭代环境实测，量级参考；随工具链漂移）。
+
+- 【单 kernel 三阶段融合】Phase 1（6 对非对角块打分）+ Phase 2（对角块下三角逆）+
+  Phase 3（链式合并）在一个 kernel 内完成：块间中间结果只经寄存器/UB、不落 HBM，
+  对比分 kernel 实现省两次全局往返与同步点 —— 融合的代价是单 CTA 寄存器预算更紧，
+  这反过来推动了 head-merge 与整块 tiling。
+- 【截断逆幂级数（核心数学创新）】把 Phase 2 的逐行前向替换（串行 64 步）与 Phase 3
+  的链式小 dot 替换为重复平方展开
+  `(I−L)⁻¹ = (I−L)(I+L²)(I+L⁴)(I+L⁸)`：6 个 [64,64] dot（3 个平方 + 3 个累乘）即可。
+  npow 扫描 5/4/3/2 → 19.2/16.2/**14.4**/18.0ms：截断阶数每 +1，精度更高但 dot 串行链
+  更长 —— 曲线给出"代数展开阶数 vs 硬件流水深度"的最优点 NP=3，而不是拍脑袋选 4。
+- 【对角引用点设计】跨块指数 `exp2(G_i − G_i[last])` 以子块**末尾** token 的 gate 为
+  参考点，把 (i,j) 块间打分分解为两个独立子块的预乘 + 一次矩阵乘 —— 与 K2 的 exp2
+  拆分同源，但作用在块-块粒度，使 6 个非对角块共享同一套列因子。
+- 【head-merge 的双重收益】R2 起 HM=16 使 66.5→14.5ms（~4.6×）：除摊薄每 CTA 的
+  标量 setup 外，高 CTA 数（24576）会触发 CANN UB 分配 aicore exception，降 CTA 数
+  到 1536 一并规避 —— 一个改动同时解决性能与稳定性两个问题。
+- 【编译器能力边界要量化】triton-ascend 无 `tl.extract_slice`/动态索引 ⇒ Phase 2 的
+  "寄存器预加载"方案在动手前论证不可行；fp16 路线用实测证伪（dot 被 upcast 回 fp32、
+  cube 不启用）；`input_precision="ieee"` 15 处在 Ascend 上反而限制优化 → 全去掉。
+- 【瓶颈判定】aic_scalar≈49%、cube≈12% ⇒ 主瓶颈不是吞吐，而是 Phase 3 的
+  `Ai_10→Ai_20/Ai_21→Ai_31→Ai_30` 6-dot 串行依赖链 + 每 CTA 的标量 setup —— 这决定了
+  后续优化的正确方向是"缩短逆链的代数依赖"（更高阶逆估计/重排），而不是调 dot 形状
+  与数据布局这类吞吐型参数。

@@ -12,8 +12,15 @@
 ## 0. 三题共通：可复现的前提
 
 1. **官方基线自证**：候选应给出目标 case 一次 msprof `Task Duration(us)` 每调用均值，
-   落在表中区间才算"复现成功"：
-   K2 ≈9.5–9.8ms / K3 ≈14.4–14.9ms / K5 ≈9.1–9.5ms（单 kernel 隔离，±10%）。
+   落在表中区间才算"复现成功"（2026-09-07 本机 triton-ascend 3.2.1 实测口径，单 kernel
+   隔离，±10%）：
+   K2 ≈5.55ms / K3 ≈10.70ms / K5 ≈11.43ms（其余 K1 ≈1.37 / K4 ≈3.62 / K6 ≈3.91ms）。
+   > 数字随工具链版本漂移（如 CANN 9.0/910B2 旧环境 K2≈9.5-9.8、K3≈14.4-14.9、
+   > K5≈9.1-9.5），判定以"同容器复测 + 同口径对比"为准，表内区间仅作参考锚点。
+   > 工具链口径：包内 kernel 已并入 CANN 9.1 兼容形态（K2 hm2 满宽写 + driver
+   > torch.gather；K5 外积输入侧转置 ≈11.4–11.6ms，见 k5/PROBLEM §5）。若候选容器
+   > 工具链与测基线环境不同（CANN 9.0 vs 9.1），区间本身会漂移 —— 判定优先看
+   > "同容器复现 + 同口径对比"，表内区间作参考锚点。
 2. **同口径比较**：收益必须对照**他自己复现的基线**（同卡、同 repeats/warmup、
    同会话）。跨时段/跨卡对比不可信。
 3. **正确性门槛**：`python3 test.py`（默认 BT/BC=64/16）目标 case `max_diff<1e-2`。
@@ -46,12 +53,18 @@
 ### 题 K2 — token_parallel
 
 **真实瓶颈**：内存延迟 / 低利用率（非带宽、非饱和）。msprof 各 pipe 全 <37%，
-mac 仅 ~7%，aic_scalar ~33%，aiv 36%。CPU 侧每 head 的 2D 访存地址生成是剩余标量成本；
-`tl.gather` 收拢对角块后已无参数级杠杆（HM/NW/NS 全扫 ≈9.76ms 平）。
+mac 仅 ~7%，aic_scalar ~33%，aiv 36%。CPU 侧每 head 的 2D 访存地址生成是剩余标量成本；对角块收拢（hm2 满宽写 +
+driver torch.gather）后已无参数级杠杆（旧工具链 HM/NW/NS 全扫 ≈9.76ms 平台期；
+3.2.1 实测 5.55ms 口径下同样无参数级杠杆）。
 
 **已是收敛配置**：HM=16（head-merge，摊每 CTA 标量 setup）、Route A 数学变换
 `exp2(g[i]-g[j])→exp2(g[i])·exp2(-g[j])` 批量 tl.dot、chunked grid 消除 grid 超限
-（上游 1 CTA/token/head 在 T=16384 会超 coreDim 65535）。
+（上游 1 CTA/token/head 在 T=16384 会超 coreDim 65535）、Akk 满宽写 scratch +
+driver `torch.gather` 收拢（hm2）。
+
+**工具链防坑（包内已处理）**：kernel 内 `tl.gather` 收拢（hm3）在 triton-ascend
+3.2.1 对 **tl.dot 输出** gather 数值错误（Akk max_diff≈0.32）且 ~3× 慢，已回退 hm2
+并标 DEPRECATED —— 若候选人报出 hm3/gather 式改写，先查精度门槛再谈收益。
 
 **开放方向（真杠杆）**：
 - BT=128 chunk 统一（把 NT 减半、提高每 CTA 有效工作、摊薄启动/地址成本）——但要
@@ -86,7 +99,13 @@ num_warps 1–16、num_stages 1–2 几乎无影响。Round3 把 4 dot/chunk→2
 唯一大收益（9.78→9.09ms）。`tl.range(num_stages=3)` 软流水再 −0.4ms（9.51→9.11）。
 
 **已是收敛配置**：BV=V=128（整 V 驻留一个 CTA）、单 K-tile（K=128 整 K 一个 tile →
-每 chunk 2 dot）、`tl.range(NT, num_stages=3)`、K=64 flat-store vs K≠64 2D-store 分路径。
+每 chunk 2 dot）、`tl.range(NT, num_stages=3)`、快照/终态统一 2D 手动指针 store
+（CANN 9.1 下 K=64 的 flat reshape 触发 expand_shape bug，分路径已移除）。
+
+**当前工具链注意**：④ 外积已改为输入侧转置 `dot(trans(b_v), b_k)`（CANN 9.1 编译
+兼容形态，本机 3.2.1 实测 11.43ms，三替代形态 21.8/22.3ms 更差）—— 相对旧口径
+9.15ms 的 +25% 是**编译兼容代价而非候选收益空间**；判别候选人优化时与同形态复现
+基线对比。
 
 **开放方向（真杠杆）**：
 - 递推本质上串行（chunk c+1 需要 chunk c 的状态）——**block 级并行受制于序列依赖**；

@@ -87,15 +87,18 @@ for i_t in tl.range(NT, num_stages=NS):        # chunk 链（唯一串行维，�
     last = min((i_t+1)*BT, T) − 1               # chunk 末有效 token
     b_gn = load gk [last, offs_k]               # [K] 逐通道累计 gate
     b_h *= exp2(b_gn)[None, :]                  # ③ [1,K] 广播到 [BV,K] 逐列乘
-    b_k = load k [i_t*BT:(i_t+1)*BT, :]  #（实载为转置 block [K,BT]）
-    b_h += tl.trans(tl.dot(b_k, b_v))           # ④ [K,BT]@[BT,BV] →ᵀ→ [BV,K] 累加
+    b_k = load k [i_t*BT:(i_t+1)*BT, :]         # 行主 [BT,K] block（整 K 单 dot）
+    b_h += tl.dot(tl.trans(b_v), b_k)           # ④ 输入侧转置 [BV,BT]@[BT,K] → [BV,K]
+                                                # 累加（数学等价 trans(dot(k,b_v))；
+                                                # 后者在 CANN 9.1 编译失败，见 §5）
 store initial_state[indices[b], h] 的 [i_v*BV:(i_v+1)*BV, :] = b_h   # 终态 in-place
 ```
 
 > **h 快照与终态写回**：每个 chunk 一进就先 `h[i_t]=state`（输出给 K6 当该 chunk 的起始
 > 记忆），跑完 NT 个 chunk 再把最终 state in-place 写回 `initial_state[indices[b],h]`
 > （下个 batch 直接用）。triton-ascend 对 `(V,K)` 形状的 block_ptr store 有寄存器损坏 bug，
-> 故 K=64 走 flat 1D store、K≠64 走通用 2D 手动指针 store（勿改回 flat reshape）。
+> 故快照与终态统一走行步长 K 的 2D 手动指针 `tl.store`（`_store_h_full`，任意 K 含 K=64；
+> 勿改回 flat reshape —— CANN 9.1 的 expand_shape 会报错，见 §5）。
 >
 > 尾 chunk 不满 BT 时 `last=min(…,T)−1` 取到末有效 token、越界行补 0 即可（参考同样补 0
 > 再裁）。`h`、`v_new`、终态三者都要与参考一致（§4 口径）。
@@ -117,4 +120,36 @@ msprof --output=./prof_k5 --application="python3 test.py --perf --repeats 7 --wa
     && python3 test.py --report ./prof_k5        # ② 基线（msprof Task Duration 每调用均值）
 ```
 
-官方基线 ≈ **9.1–9.5 ms/调用**（±10%）；门槛 `max_diff < 1e-2`。
+官方基线 ≈ **11.43 ms/调用**（±10%，2026-09-07 本机 triton-ascend 3.2.1 msprof 实测
+口径；④ 输入侧转置形态，见 §5。旧 CANN 9.0 口径 9.1–9.5 仅作历史参考）；
+门槛 `max_diff < 1e-2`。
+
+## 5. 设计创新点与深度解析
+
+> 本节复盘**基线 kernel 的设计决策链**（数字为迭代环境实测，量级参考；随工具链漂移）。
+
+- 【串行性的归属设计】K5 是全链**唯一 chunk 间有依赖**的算子。state 逐 (b,h) 私有 ⇒
+  让一个 CTA 独占一个 (b,h) 的整条 state 链（`grid=(cdiv(V,BV), B·H)`），NT=256 的
+  串行递推在 CTA 内部跑完 —— 并行度交给 B·H×(V/BV) 个互不通信的 CTA。"把依赖留在
+  块内、把并行留给块间"。
+- 【BV=V 单调最优】BV 扫描 32/64/128 → 40/20/10ms：整 V 驻留一个 CTA 使每 chunk 恰好
+  2 个 dot（② 预测 + ④ 外积），state 全程寄存器驻留；分块越多、每 chunk dot 数越多、
+  寄存器-UB 往返越频繁 —— 扫描曲线直接给出最优，而非猜测。
+- 【整 K 单 tile】K=128 时每 chunk 从 4 dot 降到 2 dot（9.78→9.09ms）；同一轮隔离
+  实验测出本 kernel 的访存下界 ≈3.02ms —— "当前离下界还有多远"成为判断后续优化
+  空间（而不是感觉"还能优化"）的锚点。
+- 【软件流水线要接线】`tl.range(NT, num_stages=NS)` 是唯一能让预取生效的写法 ——
+  早期直接传 `num_stages` 参数被 triton-ascend **静默忽略**（不报错、不生效）；
+  NS=3 接线后 9.51→9.11ms。编译器行为必须实测，文档假设不可靠。
+- 【衰减时点 = 语义设计】用 chunk 末 token 的累计 gk **一次**乘 state（③ 在②之后、
+  ④ 之前）：② 用未衰减快照预测残差，③ 让旧记忆退场，④ 叠加的新记忆不背本次衰减
+  —— 一个乘法的位置同时满足 delta-rule 语义与"64 token 只衰减一次"的性能需求。
+- 【CANN 9.1 编译坑的根因级修复（本包内核形态）】`state += trans(dot(k, b_v))` 的
+  "dot 输出转置 + 累加"链触发 hivm-plan-memory root-alloc 失败（误报 ub overflow）⇒
+  改写为**输入侧转置** `dot(trans(b_v), b_k)`（行主 [BT,K] 加载、数学等价）。三形态
+  实测 11.5 / 21.8 / 22.3ms，11.5ms 为当前最优可用（vs 旧工具链 9.15ms，+25% 是编译
+  兼容代价，不是优化空间）；K=64 的 flat reshape store 触发 expand_shape bug
+  （"collapsed dim size 2048 must equal 4096"）⇒ 快照/终态统一 2D 手动指针 store。
+- 【收敛论证参考】NT=256 串行链 + cube 利用率仅 3–4%：除非把 delta-rule 更新写成
+  可块化的数学形式（matrix-geometric / 半环前缀和类分解），chunk 链就是下界 ——
+  注意 BT=128 能让链条减半，但破坏六算子共享的 chunk 契约（下游对不上），是无效捷径。

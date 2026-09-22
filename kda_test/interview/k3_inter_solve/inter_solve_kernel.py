@@ -14,12 +14,12 @@
 计算内容:
 
     Phase 1（非对角线块, 每 CTA 一个 (chunk, head)）:
-        Akk_ij = (K_i * exp2(G_i - G_i[last])) @ (K_j * exp2(G_i[last] - G_j))^T * beta_i
+        Akk_ij = (K_i * exp2(G_i - G_i[last])) @ (K_j * exp2(G_i[last] - G_j))^T * beta_j
         Aqk_ij = (Q_i * exp2(G_i - G_i[last])) @ (K_j * exp2(G_i[last] - G_j))^T * scale
           (i, j = 0..3, i > j;  G_i[last] 是子块 i 的**末尾** token 的 g 参考点)
 
     Phase 2（对 4 个对角 16×16 下三角子块做逐行前向替换求逆）:
-        D_inv = (I + tril(D))^{-1}   (逐行累加, fp32; 符号为 +, 等价于对 -tril(D) 行前向消元)
+        D_inv = (I - tril(D))^{-1}   (逐行累加, fp32)
 
     Phase 3（链式矩阵乘合并逆）:
         Ai_10 = -Ai_11 @ Akk_10 @ Ai_00

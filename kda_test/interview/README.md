@@ -11,6 +11,7 @@ interview/
 ├── README.md                          ← 本文件（环境 + 交付物）
 ├── env.sh                             ← 容器环境准备（source 一次）
 ├── GRADER.md                          ← 【仅面试官】评分细则（勿发给候选人）
+├── TEST_REPORT.md                     ← 2026-09-07 验收测试报告（环境/版本、精度、性能、AscendC 对比）
 ├── k1_gate_chunk_cumsum/
 │   ├── PROBLEM.md                     ← 题面（K1）
 │   ├── gate_chunk_cumsum_kernel.py    ← 你要读/改的 kernel（唯一改动点）
@@ -19,8 +20,18 @@ interview/
 ├── k3_inter_solve/                    ← 题面 K3
 ├── k4_recompute_w_u/                  ← 题面 K4
 ├── k5_delta_rule_h/                   ← 题面 K5
-└── k6_gla_output/                     ← 题面 K6
+├── k6_gla_output/                     ← 题面 K6
+└── bench/                             ← 【开发者用，勿发候选人】6-kernel 统一
+                                         拉通 bench（全链正确性 + msprof 分段
+                                         计时 + ASCENDC 融合算子对照），kernel
+                                         从 ../k*_*/ 导入；用法见 bench/README.md
 ```
+
+> 包内 kernel 已并入当前工具链的修复版（与 `kda_test/design/<op>/src` 同步）：
+> K2 对角块收拢回退 hm2（满宽写 scratch + driver `torch.gather` —— `tl.gather`
+> 在 triton-ascend 3.2.1 下对 dot 输出数值错误 max_diff≈0.32）；K5 外积与快照
+> store 改为 CANN 9.1 可编译形态（输入侧转置 + 统一 2D store）。每题设计深度
+> 见各自目录 `PROBLEM.md` 末尾「设计创新点与深度解析」。
 
 **统一目标 case**（六题共用，评分口径）：`D_KV128_H96_T16384`
 → B=1, T=16384, H=96, K=V=128。所有性能以该 case 为准，具体基线与测量命令见各 `PROBLEM.md`。

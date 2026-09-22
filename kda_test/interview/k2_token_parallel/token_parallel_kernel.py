@@ -16,7 +16,7 @@
   * ``token_parallel_triton`` —— triton kernel 版（Route A: 向量化 sub-chunk 计算,
                                 消除内层 Python for j 循环; 使用 tl.dot 批量矩阵乘）
 
-优化说明（本包内该 kernel 即最终收敛版；迭代史见配套 README「已知结论」）:
+优化说明（见 OPTIMIZATION_LOG.md / kernel_metadata.json）:
   * 原 kernel 为 1 CTA/token/head, grid=(B*T, H), 大 case (B*T*H) 展平后
     远超 NPU coreDim 上限 65535 → kernel 无法启动。
   * Route A (本文件) + Route B (token_parallel_kernel_opt_B.py) 均改为
@@ -325,7 +325,11 @@ def _token_parallel_kernel_hm3(
 ):
     """head-merged v3: 同 hm2, 但 Akk 对角线块用 tl.gather 在 kernel 内收拢为
     [BT,BC] 紧凑写回 [B,T,H,BC]，消除 scratch 满宽写 + driver torch.gather
-    （msprof: gather 链 ~2ms/调用）。K 需为 2 幂。"""
+    （msprof: gather 链 ~2ms/调用）。K 需为 2 幂。
+
+    DEPRECATED: triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时
+    数值错误 (Akk max_diff≈0.32) 且 ~3x 慢, driver 已切回 hm2 路径
+    (token_parallel_triton)。保留仅作参考, 待 tl.gather 修复后可复用。"""
     i_cg, i_hg = tl.program_id(0), tl.program_id(1)
     NT = tl.cdiv(T, BT)
     n_hg = H // HM
@@ -442,14 +446,19 @@ def token_parallel_triton(
     if K == BK:
         HM = _K2_HM if H % _K2_HM == 0 else 1
         grid = (NT, B * (H // HM))
+        scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
         if Akk is None:
             Akk = torch.empty(B, TP, H, BC, device=dev, dtype=torch.float32)
-        _token_parallel_kernel_hm3[grid](
-            q, k, gk, beta, Aqk, Akk, float(scale),
-            T, H=H, K=K, BT=BT, BC=BC, HM=HM, NS=_K2_NS,
-            num_warps=_K2_NW,
+        # 注意: 不用 _token_parallel_kernel_hm3 (kernel 内 tl.gather 收拢)。
+        # triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时结果错误
+        # (实测 Akk max_diff≈0.32) 且退化 ~3x 慢。改回 hm2: 满宽写 scratch +
+        # driver torch.gather 收拢 (实测 max_diff≈8.9e-8)。
+        _token_parallel_kernel_hm2[grid](
+            q, k, gk, beta, Aqk, scratch, float(scale),
+            T, H=H, K=K, BT=BT, BC=BC, HM=HM, num_warps=_K2_NW,
         )
         torch.npu.synchronize()
+        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
         return Aqk[:, :T], Akk[:, :T]
     # 回退路径: K 非 2 幂 → 原 _token_parallel_kernel + torch.gather 收拢
     scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)

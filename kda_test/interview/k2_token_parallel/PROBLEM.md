@@ -72,14 +72,18 @@ strict = (块号 r//BC == 块号 c//BC) & (行内 r%BC > 列内 c%BC)   # 去对
 Aqk_full = tl.where(keep,   Aqk_full, 0.0)
 Akk_full = tl.where(strict, Akk_full, 0.0)
 tl.store(Aqk + 行 t 写宽 BT, Aqk_full)                    # 满宽 [BT,BT]
-Akk_diag = tl.gather(Akk_full, 每行对角段列下标, axis=1)    # 收拢 [BT,BC]
-tl.store(Akk + 行 t 写宽 BC, Akk_diag)                    # 紧凑 [B,T,H,16]
+tl.store(Akk_scratch + 行 t 写宽 BT, Akk_full)            # Akk 满宽写 scratch
+# driver 收拢: Akk = torch.gather(Akk_scratch, 对角段列下标)   # 紧凑 [B,T,H,16]
 ```
 
 > 收敛 kernel 把同一 chunk 的 4 个 16 窗口拼成一次整 chunk `[64,K]@[K,64]` 大 dot（比逐
 > 窗口少启几次小 dot），再整体按"对角 16 块 ∧ 块内因果"置零 —— 与逐窗口数值一致。
-> Ascend MTE 列须单调：Akk 的紧凑列映射在 kernel 内 `tl.gather` 收拢，不做非单调宽写
-> （输出缓冲按 NT·BT 补齐，store 不加 mask）。
+> Ascend MTE 列须单调：Akk 的紧凑列映射（对角段在每行内的起始列不同）若窄宽直写会
+> 非单调 ⇒ 收敛版（hm2）先满宽写 scratch（按 NT·BT 补齐、store 不加 mask），再在
+> driver 里 `torch.gather` 收拢对角段。kernel 内 `tl.gather` 一步收拢（hm3）曾尝试
+> （省 driver 侧 ~2ms/调用），但 triton-ascend 3.2.1 对 **tl.dot 输出**做 gather
+> 数值错误（实测 Akk max_diff≈0.32）且 ~3× 慢 ⇒ 已回退 hm2 并标注 DEPRECATED
+> （详见 §5）。
 
 ## 4. 约束与验收
 
@@ -95,4 +99,35 @@ msprof --output=./prof_k2 --application="python3 test.py --perf --repeats 7 --wa
     && python3 test.py --report ./prof_k2        # ② 基线（msprof Task Duration 每调用均值）
 ```
 
-官方基线 ≈ **9.5–9.8 ms/调用**（±10%）；门槛 `max_diff < 1e-2`。
+官方基线 ≈ **5.55 ms/调用**（±10%，2026-09-07 本机 triton-ascend 3.2.1 msprof 实测口径）；
+门槛 `max_diff < 1e-2`。
+
+## 5. 设计创新点与深度解析
+
+> 本节复盘**基线 kernel 的设计决策链**（数字为迭代环境实测，量级参考；随工具链漂移）。
+> 本 kernel 是"数学变换 > 编译器技巧"最典型的样本。
+
+- 【数学变换（Route A）】`exp2(g[i]−g[j]) = exp2(g[i])·exp2(−g[j])`：把逐 token 对的
+  指数差拆成行/列因子**预乘**，整个 sub-chunk 从"逐元素指数 + 内积循环"变成一次批量
+  `tl.dot` —— Python 内层 for j 循环被结构性消除，`aiv_scalar_ratio` 0.38→0.059
+  （首次低于 0.10 门限）。代数重组的效果是编译器调度追不上的。
+- 【一次 dot 出两张表】Aqk/Akk 只差行向量（q vs k·β）与含/去对角线：共用 gated-key 列
+  `ke = k·exp2(−g)`，同一 `[BT,K]@[K,BT]` 大 dot 的产物按两套掩码写两个输出 —— 行
+  因子的一次预乘同时服务两路。
+- 【CTA 粒度 = 标量放大器】每 CTA 的固定标量 setup（arange 偏移/掩码/指针 base）与
+  tile 大小无关：head-merge HM=16 把 24576 个 CTA 并成 1536 个（每 CTA 串行 16 个
+  head），10.5→8.66ms；顺带把高 CTA 数触发的 CANN UB 分配 aicore exception 一起规避。
+- 【标量裁剪清单】scale 折叠进 pre-dot 的 q；eg/eneg 每元素只算一次；因果掩码提到
+  循环外预计算；K 为 2 幂时整条 K 维掩码去掉（constexpr 分派）——每一处都在削
+  "每 CTA 固定成本"。
+- 【MTE 单调列约束 → 两步写】Akk 对角段在每行的起始列不同，紧凑窄宽写会令 MTE 列
+  寻址非单调而越界 ⇒ 收敛版先满宽写 scratch（按 NT·BT 补齐、store 不加 mask），再由
+  driver `torch.gather` 收拢。布局妥协换 kernel 内的确定性与免 memset。
+- 【工具链实测与回退（重要教训）】kernel 内 `tl.gather` 一步收拢（hm3）曾在旧工具链省
+  ~2ms/调用；但 triton-ascend 3.2.1 对 **tl.dot 输出**做 gather 会**静默算错**
+  （Akk max_diff≈0.32，非编译失败！）且 ~3× 慢 ⇒ 回退 hm2 满宽写 + driver gather
+  （max_diff≈8.9e-8）并保留 DEPRECATED —— "能编译 ≠ 正确"，任何 kernel 级技巧落地
+  都必须带精度门槛验证。
+- 【收敛论证参考】msprof 各 pipe 利用率全 <37%、cube 仅 ~7%，属内存延迟/低利用率型
+  瓶颈；HM/NW/NS 全扫 ≈9.76ms 平台期 —— 声称"参数级杠杆已耗尽"需要这种全扫证据链，
+  而不是感觉。

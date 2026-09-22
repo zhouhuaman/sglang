@@ -289,7 +289,7 @@ def chunk_gla_fwd_kernel_o(
     s_a_t: tl.constexpr = H * BT      # A 在 T 维的 stride
 
     # 下三角因果 mask: m_s[i, j] = (i >= j)  (fp32)
-    m_s = tl.arange(0, BT)[:, None].to(tl.float32) >= tl.arange(0, BT)[None, :].to(tl.float32)
+    m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]   # bool 掩码（勿改 fp32: 3.2.1 对 fp32 where→dot 输入误编译）
 
     b_o = tl.zeros([BT, BV], dtype=tl.float32)
 
@@ -374,7 +374,7 @@ def chunk_gla_fwd_kernel_o_hm(
     # ── 循环不变向量（与 head 无关，全部提升到头循环外）──
     r = tl.arange(0, BT)
     c = tl.arange(0, BT)
-    m_s = r[:, None].to(tl.float32) >= c[None, :].to(tl.float32)   # 因果 mask [BT,BT]
+    m_s = r[:, None] >= c[None, :]   # 因果 mask [BT,BT] (bool；勿改 fp32 compare + where → 3.2.1 误编译见 OPTIMIZATION_LOG)
     r_mask = (i_t * BT + r) < T
     k_mask = tl.arange(0, BK) < K
     v_mask = (i_v * BV + tl.arange(0, BV)) < V

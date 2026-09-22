@@ -107,4 +107,26 @@ msprof --output=./prof_k4 --application="python3 test.py --perf --repeats 7 --wa
     && python3 test.py --report ./prof_k4        # ② 基线（msprof Task Duration 每调用均值）
 ```
 
-官方基线 ≈ **4.62 ms/调用**（±10%）；门槛 `max_diff < 1e-2`。
+官方基线 ≈ **3.62 ms/调用**（±10%，2026-09-07 本机 triton-ascend 3.2.1 msprof 实测口径）；
+门槛 `max_diff < 1e-2`。
+
+## 5. 设计创新点与深度解析
+
+> 本节复盘**基线 kernel 的设计决策链**（数字为迭代环境实测，量级参考；随工具链漂移）。
+
+- 【代数重组（跨算子协同）】`w = A@(k·β·exp2(gk))`、`u = A@(v·β)`、`kg = k·exp2(gk_last−gk)`
+  把 K5 逐 chunk 递推所需的原始 k/v 改写成"每 chunk 自包含的解耦表示"：K5 从此只读
+  w/u/kg 三个 [B,T,H,K]，不再需要把 A 的因果结构带进递推 —— 本 kernel 是 K5 能把
+  串行递推压到每 chunk 2 个 dot 的代数前提。
+- 【单 tile 直通（Route A）】`BK=K、BV=V`：无 tile 循环、无 K/V 维掩码；`T_FULL`
+  constexpr 分派（T%BT==0 时连行边界检查都免）⇒ `aic_scalar` 0.359→0.094（−74%）、
+  整体 1.68× —— "掩码/边界检查是标量开销主要来源"的量化证据。
+- 【寄存器复用】`A_inv [BT,BT]` 与 `beta [BT]` 公共加载后留寄存器：V 维（u）与 K 维
+  （w）两个 dot 共享同一份 A；kg 在 k 的访存窗口内顺带计算 —— 每个从 HBM 搬进来的
+  字节被尽量多的 dot 复用。
+- 【HM=16 的干净样本】CTA 24576→1536 → 6796→4514us（1.51×），且精度 **bitwise
+  max_diff=0.0**：head-merge 不改变任何浮点运算顺序，是"摊薄 per-CTA 固定开销"的
+  纯收益案例 —— 与 K2/K3/K6 的 HM 收益互为印证，说明瓶颈同源。
+- 【负结果入库（防重复扫描）】num_warps>4 时 warp 调度开销反超收益；`tf32` 在
+  triton-ascend 上等价 `ieee`（input_precision 参数无效）；512B 行对齐能提升向量
+  利用率 —— 这些"试过但放弃"的结论与正收益同等重要，构成收敛论证的一部分。
