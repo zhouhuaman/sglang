@@ -276,9 +276,27 @@ def _recompute_w_u_kernel(
             p_gk = gk + off_bh * K
 
         # ── A_inv [BT, BT] — manual pointer ──
-        b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :]).to(tl.float32)
+        # A_inv [BT, BT]。非 T_FULL 时最后一 chunk 的行/列会越过张量末尾
+        # （Akk_inv 是 [B, T, H, BT]，只有 T 行）：不 mask 会读到相邻内存的
+        # 脏数据，fp16 下脏位常解码为 NaN，NaN*0=NaN 污染有效行的 dot 结果
+        # （实测 T%64≠0 时 w/u 最后一行全 NaN，而不用 b_A 的 kg 干净）。
+        # 行/列同时按 m_t 收敛，与 torch 参考的零填充一致。
+        if T_FULL:
+            b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :]).to(tl.float32)
+        else:
+            b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :],
+                          mask=m_t[:, None] & m_t[None, :], other=0.0).to(tl.float32)
         # ── beta [BT] ──
-        b_b = tl.load(p_beta + (base + o_bt) * s_beta).to(tl.float32)
+        # beta 是唯一原先没有 T_FULL 分支的输入：非 T_FULL 时最后一 chunk
+        # 的行越过张量末尾（beta 是 [B, T, H]），脏位在 fp16 下常解码为
+        # NaN；即使 k/v 已 mask 成 0，0*NaN 仍是 NaN，于是 b_kb/b_vb 被污染
+        # → w/u 最后一行 NaN（kg 不乘 beta，故干净，这正是定位依据）。
+        # other=0.0 与 torch 参考的零填充 beta 一致。
+        if T_FULL:
+            b_b = tl.load(p_beta + (base + o_bt) * s_beta).to(tl.float32)
+        else:
+            b_b = tl.load(p_beta + (base + o_bt) * s_beta,
+                          mask=m_t, other=0.0).to(tl.float32)
 
         # ── V 维单 tile: u = A @ (v * beta) ──
         if T_FULL:

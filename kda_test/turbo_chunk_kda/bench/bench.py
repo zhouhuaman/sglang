@@ -51,6 +51,7 @@ from turbo_gate_chunk_cumsum_kernel import (  # noqa: E402
     turbo_gate_chunk_cumsum_triton as k1_triton,
     turbo_gate_chunk_cumsum_torch as k1_torch,
 )
+import turbo_gate_chunk_cumsum_kernel as k1_mod  # noqa: E402  # 读 K1_MODE/_vector_core_num 以对齐 grid 检查
 from turbo_token_parallel_kernel import (  # noqa: E402
     turbo_token_parallel_torch as k2_torch,
     turbo_token_parallel_triton as k2_triton,
@@ -267,7 +268,8 @@ def _kernel_grid_size(kernel_id, B, T, H, K, V):
     """返回 triton kernel 的展平 grid 大小（各维乘积）。
 
     用于检查是否超过 NPU coreDim 上限 65535。grid 形状取自各 kernel driver:
-      K1: (cdiv(K,32), cdiv(T,64), B*H)
+      K1: K1_MODE=1 → (min(cdiv(K,128)*cdiv(T,64)*B*H, vector_core_num),)
+          K1_MODE=0 → (cdiv(K,128), cdiv(T,64), B*H)
       K2: (B*T, H)
       K3: (cdiv(T,64), B*H)
       K4: (cdiv(T,64), B*H)
@@ -276,7 +278,17 @@ def _kernel_grid_size(kernel_id, B, T, H, K, V):
     """
     BT = _BT
     if kernel_id == "K1":
-        return _cdiv(K, 128) * _cdiv(T, BT) * (B * H)  # BS=128 (见 gate_kernel.py OPTIMIZATION_LOG.md 第二轮优化)
+        # BS=128 (见 gate_kernel.py OPTIMIZATION_LOG.md 第二轮优化)
+        total = _cdiv(K, 128) * _cdiv(T, BT) * (B * H)
+        # 迁移后默认走一维 grid（K1_MODE=1，见 turbo_gate_chunk_cumsum_kernel.py）:
+        #   grid = (min(total, vector_core_num),)
+        # 展平数恒 ≤ vector core 数（A5=56 / 910B2=48），与 shape 无关，故
+        # A_B4_H8_T131072 这类大 case 的 K1 不再受 coreDim 65535 限制。
+        # K1_MODE=0 回退原三维 grid，仍按老公式检查。
+        if k1_mod._K1_MODE:
+            ncore = k1_mod._K1_GRID or k1_mod._vector_core_num()
+            return min(total, ncore)
+        return total
     if kernel_id == "K2":
         return _cdiv(T, BT) * (B * H)  # chunked grid: (B*cdiv(T,BT), H)
     if kernel_id in ("K3", "K4"):

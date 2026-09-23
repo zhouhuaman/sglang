@@ -315,88 +315,6 @@ def _token_parallel_kernel_hm2(
         tl.store(base_akk + row_akk + col_bt, Akk_full)
 
 
-@triton.jit(do_not_specialize=["T"])
-def _token_parallel_kernel_hm3(
-    q, k, g, beta, Aqk, AkkOut,
-    scale,
-    T, H: tl.constexpr, K: tl.constexpr,
-    BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr,
-    NS: tl.constexpr,
-):
-    """head-merged v3: 同 hm2, 但 Akk 对角线块用 tl.gather 在 kernel 内收拢为
-    [BT,BC] 紧凑写回 [B,T,H,BC]，消除 scratch 满宽写 + driver torch.gather
-    （msprof: gather 链 ~2ms/调用）。K 需为 2 幂。
-
-    DEPRECATED: triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时
-    数值错误 (Akk max_diff≈0.32) 且 ~3x 慢, driver 已切回 hm2 路径
-    (turbo_token_parallel_triton)。保留仅作参考, 待 tl.gather 修复后可复用。"""
-    i_cg, i_hg = tl.program_id(0), tl.program_id(1)
-    NT = tl.cdiv(T, BT)
-    n_hg = H // HM
-    i_b = i_hg // n_hg
-    hg0 = i_hg % n_hg
-    bos = i_b * T
-    i_c = i_cg % NT
-    chunk_start = i_c * BT
-
-    o_k = tl.arange(0, K)
-    o_r = tl.arange(0, BT)
-    T_fp = T.to(tl.float32)
-    chunk_start_fp = chunk_start.to(tl.float32)
-    m_rows = (chunk_start_fp + o_r.to(tl.float32)) < T_fp
-
-    br = o_r // BC
-    bc_ = tl.arange(0, BT) // BC
-    ri = o_r % BC
-    ci = tl.arange(0, BT) % BC
-    diag = br[:, None] == bc_[None, :]
-    keep = diag & (ri[:, None] >= ci[None, :])      # Aqk: j<=i 同 sub-chunk
-    o_cc = tl.arange(0, BC)
-    col_idx = (o_r // BC)[:, None] * BC + o_cc[None, :]   # [BT,BC] 行依赖列偏移
-    strict = (o_r % BC)[:, None] > o_cc[None, :]          # Akk: 块内 j<i
-
-    row_offset = (chunk_start + o_r[:, None]) * H * K
-    col_bt = tl.arange(0, BT)[None, :]
-    row_aqk = (chunk_start + o_r[:, None]) * H * BT
-    row_akk = (chunk_start + o_r[:, None]) * H * BC
-
-    for hh in tl.range(HM, num_stages=NS):
-        i_h = hg0 * HM + hh
-        base_q = q + bos * H * K + i_h * K
-        base_k = k + bos * H * K + i_h * K
-        base_g = g + bos * H * K + i_h * K
-        base_beta = beta + bos * H + i_h
-        base_aqk = Aqk + bos * H * BT + i_h * BT
-        base_akk = AkkOut + bos * H * BC + i_h * BC
-
-        qc = tl.load(base_q + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        kc = tl.load(base_k + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        gc = tl.load(base_g + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        betac = tl.load(base_beta + (chunk_start + o_r) * H,
-                        mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
-
-        eg = tl.math.exp2(gc)
-        eneg = tl.math.exp2(-gc)
-        qe = qc * eg * scale
-        ke = kc * eneg
-        Aqk_full = tl.dot(qe, tl.trans(ke))
-        kbe = (kc * betac[:, None]) * eg
-        Akk_full = tl.dot(kbe, tl.trans(ke))
-
-        Aqk_full = tl.where(keep, Aqk_full, 0.0)
-        tl.store(base_aqk + row_aqk + col_bt, Aqk_full)
-
-        Akk_diag = tl.gather(Akk_full, col_idx, axis=1)   # [BT,BC]
-        Akk_diag = tl.where(strict, Akk_diag, 0.0)
-        tl.store(base_akk + row_akk + o_cc[None, :], Akk_diag)
-
-
 def _gather_akk_diag(scratch, BC, T=None):
     """把 [B,TP,H,BT] scratch 中对角线 16×16 block 收拢为 [B,T,H,BC]。
 
@@ -449,16 +367,16 @@ def turbo_token_parallel_triton(
         scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
         if Akk is None:
             Akk = torch.empty(B, TP, H, BC, device=dev, dtype=torch.float32)
-        # 注意: 不用 _token_parallel_kernel_hm3 (kernel 内 tl.gather 收拢)。
-        # triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时结果错误
-        # (实测 Akk max_diff≈0.32) 且退化 ~3x 慢。改回 hm2: 满宽写 scratch +
+        # 不用"kernel 内 tl.gather 收拢对角线块"的写法: triton-ascend 3.2.1 上
+        # tl.gather 的 src 为 tl.dot 输出时结果错误 (实测 Akk max_diff≈0.32)
+        # 且退化 ~3x 慢。故走 hm2: 满宽写 scratch +
         # driver torch.gather 收拢 (实测 max_diff≈8.9e-8)。
         _token_parallel_kernel_hm2[grid](
             q, k, gk, beta, Aqk, scratch, float(scale),
             T, H=H, K=K, BT=BT, BC=BC, HM=HM, num_warps=_K2_NW,
         )
         torch.npu.synchronize()
-        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
+        Akk[:, :T].copy_(_gather_akk_diag(scratch, BC, T=T))
         return Aqk[:, :T], Akk[:, :T]
     # 回退路径: K 非 2 幂 → 原 _token_parallel_kernel + torch.gather 收拢
     scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float32)
@@ -472,5 +390,5 @@ def turbo_token_parallel_triton(
     if Akk is None:
         Akk = _gather_akk_diag(scratch, BC, T=T)
     else:
-        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
+        Akk[:, :T].copy_(_gather_akk_diag(scratch, BC, T=T))
     return Aqk, Akk

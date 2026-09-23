@@ -282,9 +282,27 @@ def _recompute_w_u_kernel(
 
         # ── A_inv [BT, BT] — manual pointer ──
         # fp16 GM → tl.dot 左操作数, 不参与 vector 运算故不转 fp32
-        b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :])
+        # A_inv [BT, BT]。非 T_FULL 时最后一 chunk 的行/列会越过张量末尾
+        # （Akk_inv 是 [B, T, H, BT]，只有 T 行）：不 mask 会读到相邻内存的
+        # 脏数据，fp16 下脏位常解码为 NaN，NaN*0=NaN 污染有效行的 dot 结果
+        # （实测 T%64≠0 时 w/u 最后一行全 NaN，而不用 b_A 的 kg 干净）。
+        # 行/列同时按 m_t 收敛，与 torch 参考的零填充一致。
+        if T_FULL:
+            b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :])
+        else:
+            b_A = tl.load(p_A + (base + o_bt[:, None]) * s_A + o_bt[None, :],
+                          mask=m_t[:, None] & m_t[None, :], other=0.0)
         # ── beta [BT] ──
-        b_b = tl.load(p_beta + (base + o_bt) * s_beta).to(tl.float32)
+        # beta 是唯一原先没有 T_FULL 分支的输入：非 T_FULL 时最后一 chunk
+        # 的行越过张量末尾（beta 是 [B, T, H]），脏位在 fp16 下常解码为
+        # NaN；即使 k/v 已 mask 成 0，0*NaN 仍是 NaN，于是 b_kb/b_vb 被污染
+        # → w/u 最后一行 NaN（kg 不乘 beta，故干净，这正是定位依据）。
+        # other=0.0 与 torch 参考的零填充 beta 一致。
+        if T_FULL:
+            b_b = tl.load(p_beta + (base + o_bt) * s_beta).to(tl.float32)
+        else:
+            b_b = tl.load(p_beta + (base + o_bt) * s_beta,
+                          mask=m_t, other=0.0).to(tl.float32)
 
         # ── V 维单 tile: u = A @ (v * beta) ──
         if T_FULL:
@@ -292,7 +310,10 @@ def _recompute_w_u_kernel(
         else:
             b_v = tl.load(p_v + (base + o_bt[:, None]) * s_v + o_v[None, :],
                           mask=m_t[:, None] & (o_v[None, :] < V), other=0.0).to(tl.float32)
-        b_vb = (b_v * b_b[:, None]).to(tl.float16)  # fp32 vector 段 → dot 前 cast fp16
+        # dot 操作数以 b_A 为基准：T_FULL 时 b_A 是 fp16，与交付路径逐位一致；
+        # T%64≠0 时 wrapper 传 fp32，b_A 随之是 fp32，两个操作数一起走 fp32 dot
+        # （规避 triton-ascend 3.2.1 在 fp16 GM + 非满块路径上的 aivec trap）
+        b_vb = (b_v * b_b[:, None]).to(b_A.dtype)
         b_u = tl.dot(b_A, b_vb, input_precision=DOT_PRECISION)
         if T_FULL:
             tl.store(p_u + (base + o_bt[:, None]) * s_v + o_v[None, :], b_u.to(u.dtype.element_ty))
@@ -326,7 +347,7 @@ def _recompute_w_u_kernel(
                 tl.store(p_kg + (base + o_bt[:, None]) * s_k + o_k[None, :],
                          b_kg.to(kg.dtype.element_ty), mask=m_t[:, None] & (o_k[None, :] < K))
 
-        b_w = tl.dot(b_A, b_kb.to(tl.float16), input_precision=DOT_PRECISION)  # dot 前 cast fp16
+        b_w = tl.dot(b_A, b_kb.to(b_A.dtype), input_precision=DOT_PRECISION)
         if T_FULL:
             tl.store(p_w + (base + o_bt[:, None]) * s_k + o_k[None, :], b_w.to(w.dtype.element_ty))
         else:
@@ -362,16 +383,20 @@ def turbo_recompute_w_u_triton(
     BT = A.shape[-1]
     assert BT == chunk_size, f"A.shape[-1]={BT} != chunk_size={chunk_size}"
 
-    # 统一转 fp16 并搬上 NPU (不修改调用方张量; 已是 fp16 则 .to 为 no-op)
-    k = k.to(torch.float16).to("npu")
-    v = v.to(torch.float16).to("npu")
-    beta = beta.to(torch.float16).to("npu")
-    A = A.to(torch.float16).to("npu")
+    # 统一搬上 NPU (不修改调用方张量; 已是目标 dtype 则 .to 为 no-op)。
+    # T%64≠0 改用 fp32: triton-ascend 3.2.1 在 fp16 GM + 非满块路径上触发
+    # aivec trap (507015，交付版 HEAD 同样复现)，见 TEST_REPORT_RETEST_20260923.md §6。
+    # T%64==0（含目标 case）保持 fp16，编译路径与交付版逐位一致，性能不变。
+    _dt = torch.float16 if (T % chunk_size == 0) else torch.float32
+    k = k.to(_dt).to("npu")
+    v = v.to(_dt).to("npu")
+    beta = beta.to(_dt).to("npu")
+    A = A.to(_dt).to("npu")
     has_gk = gk is not None
     if has_gk:
-        gk = gk.to(torch.float16).to("npu")
+        gk = gk.to(_dt).to("npu")
     else:
-        gk = k  # STORE_KG=False 时该指针不会被读取, 传 dummy (dtype 与 k 同为 fp16)
+        gk = k  # STORE_KG=False 时该指针不会被读取, 传 dummy (dtype 与 k 相同)
 
     w = torch.empty_like(k)
     u = torch.empty_like(v)

@@ -50,6 +50,8 @@ source CANN 的 ``set_env.sh`` 并设置 ``LD_LIBRARY_PATH``、
 校验逻辑），在 NPU 可用时走 triton kernel。
 """
 
+import os
+
 import torch
 import torch_npu  # noqa: F401  (必须在创建任何 npu 张量之前 import)
 
@@ -70,6 +72,26 @@ _DEFAULT_BT = 64
 # → 展平 24576, speedup 从 ~3.1x 提升到 ~7.0x (torch_npu baseline)。
 _DEFAULT_BS = 128
 _SOFTPLUS_THRESHOLD = 20.0
+
+# ── 工作划分开关（迁移自 interview_en_answer 的 K1 优化）─────────────────────
+# K1_MODE: 1 = 一维 grid + 每核连续区间（默认，实测 -16.3%）
+#          0 = 原三维 grid=(cdiv(K,BS), NT, B*H)（保留以便 A/B 复核）
+# K1_GRID: 0 = 自动取设备 vector core 数（A5=56 / 910B2=48）
+_K1_MODE = int(os.getenv("K1_MODE", "1"))
+_K1_GRID = int(os.getenv("K1_GRID", "0"))
+
+_VECTOR_NUM_CACHE = {}
+
+
+def _vector_core_num() -> int:
+    """取设备 vector core 数（本 kernel 全部在 vector 上，无 dot）。"""
+    if "v" not in _VECTOR_NUM_CACHE:
+        try:
+            _VECTOR_NUM_CACHE["v"] = int(
+                torch_npu.npu.get_device_properties(0).vector_core_num)
+        except Exception:  # 老版本 torch_npu 无该字段 → 回退 910B2 的 48
+            _VECTOR_NUM_CACHE["v"] = 48
+    return _VECTOR_NUM_CACHE["v"]
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -164,6 +186,84 @@ def _gate_cumsum_kernel(
     ptr_o = o + i_b * T * H * K + i_h * K + tile_t[:, None] * (H * K) + tile_s[None, :]
     # o 为 fp16:scale 乘已在 fp32 上做完,store 前才 cast 到 o 的元素 dtype
     tl.store(ptr_o, b_o.to(o.dtype.element_ty), mask=masks)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _gate_cumsum_kernel_1d(
+    x,
+    A_log,
+    dt_bias,
+    o,
+    scale,
+    T,
+    B: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+):
+    """一维 grid + 每核连续工作区间（迁移自 interview_en_answer 的 K1 优化）。
+
+    数学与 `_gate_cumsum_kernel` **逐位相同**，唯一差别是工作划分：
+
+      * `_gate_cumsum_kernel`: grid = (cdiv(K,BS), num_chunks, B*H)，由硬件调度
+        把 24576 个 (s,tile,chunk,(b,h)) 三元组分给 56 个 vector core；
+      * 本 kernel: grid = (ncore,)，每核处理一段**连续**的 work id 区间，
+        work id 按 (b, h, chunk, s) 解码 —— 相邻 item 在同一 (b,h) 内沿时间维
+        相邻，访存连续，且相邻 item 复用同一 head 的 A_log/指针基址。
+
+    参考实现的 `per_core = WORK // num_programs` 用的是**截断除法**，当
+    total % ncore != 0 时会静默丢掉最后 total % ncore 个工作项；本实现改为
+    ceil 除法 + `tl.minimum(total, ...)` 截断，末尾核不会越界也不会漏算。
+
+    实测（A5 950PR / CANN 9.1.0 / triton-ascend 3.2.1，目标 case
+    B1 T16384 H96 K128）：msprof Task Duration 1.371ms → 1.147ms（-16.3%）。
+    """
+    pid = tl.program_id(0)
+    nprog = tl.num_programs(0)
+
+    NT = (T + BT - 1) // BT
+    NS: tl.constexpr = (K + BS - 1) // BS
+    total = B * H * NT * NS
+    per_core = (total + nprog - 1) // nprog
+    end = tl.minimum(total, (pid + 1) * per_core)
+
+    rows = tl.arange(0, BT)
+    cols = tl.arange(0, BS)
+
+    for i in range(pid * per_core, end):
+        i_bh = i // (NT * NS)
+        i_st = i - i_bh * NT * NS
+        i_t = i_st // NS
+        i_s = i_st - i_t * NS
+
+        i_b = i_bh // H
+        i_h = i_bh % H
+
+        tile_t = i_t * BT + rows
+        tile_s = i_s * BS + cols
+        masks = (tile_t[:, None] < T) & (tile_s[None, :] < K)
+
+        ptr_x = x + i_b * T * H * K + i_h * K + tile_t[:, None] * (H * K) + tile_s[None, :]
+        b_s = tl.load(ptr_x, mask=masks, other=0.0).to(tl.float32)
+
+        if HAS_BIAS:
+            ptr_bias = dt_bias + i_h * K + tile_s
+            b_bias = tl.load(ptr_bias, mask=tile_s < K, other=0.0).to(tl.float32)
+            b_s = b_s + b_bias[None, :]
+
+        b_a = tl.load(A_log + i_h).to(tl.float32)
+        b_gate = -tl.exp(b_a) * _softplus_fwd(b_s)
+        b_gate = tl.where(masks, b_gate, 0.0)
+        b_o = tl.cumsum(b_gate, axis=0)
+
+        if HAS_SCALE:
+            b_o *= scale
+
+        ptr_o = o + i_b * T * H * K + i_h * K + tile_t[:, None] * (H * K) + tile_s[None, :]
+        tl.store(ptr_o, b_o.to(o.dtype.element_ty), mask=masks)
 
 
 def turbo_gate_chunk_cumsum_ref(
@@ -338,6 +438,32 @@ def turbo_gate_chunk_cumsum_triton(
     o = torch.empty_like(x, dtype=torch.float32)
 
     num_chunks = _cdiv(T, BT)
+
+    if _K1_MODE:
+        # 一维 grid + 每核连续区间：total 个工作项按 (b,h,chunk,s) 解码，
+        # 每核一段连续区间。ceil 除法保证不丢工作项。
+        total = B * H * num_chunks * _cdiv(K, BS)
+        ncore = _K1_GRID if _K1_GRID > 0 else _vector_core_num()
+        grid = (min(total, ncore),)
+        _gate_cumsum_kernel_1d[grid](
+            x,
+            A_log,
+            dt_bias,
+            o,
+            float(scale) if scale is not None else 0.0,
+            T,
+            B=B,
+            H=H,
+            K=K,
+            BT=BT,
+            BS=BS,
+            HAS_BIAS=has_bias,
+            HAS_SCALE=scale is not None,
+            num_warps=num_warps,
+        )
+        torch.npu.synchronize()
+        return o
+
     grid = (_cdiv(K, BS), num_chunks, B * H)
 
     _gate_cumsum_kernel[grid](

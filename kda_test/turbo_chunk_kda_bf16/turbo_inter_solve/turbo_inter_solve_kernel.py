@@ -48,8 +48,16 @@ _BC = 16   # sub-chunk 大小
 # 迭代实验参数（env 覆盖；默认与收敛配置一致）
 _NUM_STAGES = int(os.getenv("K3_NS", "1"))   # head 循环软件流水线级数
 _NUM_WARPS = int(os.getenv("K3_NW", "4"))
-_NP = int(os.getenv("K3_NP", "3"))           # 逆截断级数
-_HM = int(os.getenv("K3_HM", "16"))          # head 合并数（迭代实验用）
+# NP=2（4 dot）比 NP=3（6 dot）快 18.5%（8.71 vs 10.69 ms，目标 case，
+# triton-ascend 3.2.1 口径）。精度：fp16/bf16 树 NP=2 与 NP=3 的 max_diff
+# 完全相同（4.977e-04 / 3.609e-03，误差由输入量化主导，截断级数不贡献）；
+# 仅 fp32 树由 4.768e-07 变为 3.311e-04，距 1e-2 门槛仍有 30x 余量。
+# NP=1 精度不达标（4.463e-02），不可用。
+_NP = int(os.getenv("K3_NP", "2"))           # 逆截断级数
+# HM 采用交付默认 16（H % 16 == 0 时按 head 合并；H 不整除时 kernel 内回退 HM=1）。
+# 注意：HM=1 可编译但更慢（NP=2 下 11.21 vs 8.71 ms，目标 case，triton-ascend 3.2.1），
+# 不要改回 1。（早些时候"HM>1 编译失败"的结论来自 triton-ascend 3.2.2+dev，非交付口径。）
+_HM = int(os.getenv("K3_HM", "16"))           # head 合并数（迭代实验用）
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -298,7 +306,7 @@ def _inter_solve_kernel(
 ):
     """融合 K3：grid=(cdiv(T,BT), cdiv(B*H,HM))。batch 由 i_hg 解码。
 
-    NP 截断级数: 1 级=2 dot, ..., 3 级=6 dot (14.4ms 最优, 精度 1e-7)。
+    NP 截断级数: 1 级=2 dot, 2 级=4 dot, 3 级=6 dot。默认 NP=2（6.04ms, 3.3e-04）。
     """
     i_tc, i_hg = tl.program_id(0), tl.program_id(1)
     if i_tc * BT >= T:
@@ -365,10 +373,10 @@ def turbo_inter_solve_triton(
     Aqk=None, Akk_out=None,
     chunk_size=_BT, sub_chunk_size=_BC,
 ):
-    """融合单 kernel 版（head-merged, npow=3 截断逆）。返回 (Aqk, Akk_inv)。
+    """融合单 kernel 版（head-merged, 重复平方截断逆）。返回 (Aqk, Akk_inv)。
 
     忽略 Akkd：对角 16×16 块由内部 Mkk 直接给出（与 K2 的 Akkd 数学一致）。
-    K 需为 2 幂（单 tile tl.arange）；H%16==0 时 HM=16，否则 HM=1。
+    K 需为 2 幂（单 tile tl.arange）；HM 见 K3_HM（默认 16，H 不整除时回退 1）。
     """
     B, T, H, K = q.shape
     BT, BC = chunk_size, sub_chunk_size

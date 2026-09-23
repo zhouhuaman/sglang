@@ -27,7 +27,7 @@
 
 fp16 改造(2026-09-09,对齐 Ascend C 口径):输入 q/k/gk/beta 与输出 Aqk/Akk(含内部
 scratch)统一 fp16; kernel 内 load 后 vector 段(exp2/scale/beta 乘等)保持 fp32,
-tl.dot 输入 cast 回 fp16(dot acc/输出仍 fp32),store 前才 cast 到缓冲元素 dtype。
+store 前才 cast 到缓冲元素 dtype。tl.dot 的两个操作数**保持 fp32**(原因见下方常量区)。
 """
 
 import os
@@ -42,6 +42,10 @@ _BC = 16   # sub-chunk 大小
 # 迭代实验参数（env 覆盖；默认与收敛配置一致）
 _K2_NW = int(os.getenv("K2_NW", "1"))
 _K2_NS = int(os.getenv("K2_NS", "1"))   # head 循环软件流水线级数
+# tl.dot 的操作数**保持 fp32**（不做 fp16 下采样，无开关）: 分离式写法
+# exp2(g[i])*exp2(-g[j]) 里 exp2(-g) 实测可达 4.7e7（链内 g in [-25.5, -0.014]），
+# 超出 fp16 上限 65504 → 下采样会饱和/下溢，Aqk/Akk 相对误差最大 35%（链内目标
+# case FAIL 3.8e-02）。代价是 dot 走 fp32（4.12 → 5.21 ms），换来精度达标。
 _K2_HM = int(os.getenv("K2_HM", "16"))  # head 合并数（迭代实验用）
 
 
@@ -212,12 +216,12 @@ def _token_parallel_kernel(
     betac = tl.load(base_beta + (chunk_start + o_r) * H,
                     mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
 
-    # ── 数学变换 + 大 dot（fp16 形态: vector 段 fp32, dot 输入 cast fp16, acc fp32）──
+    # ── 数学变换 + 大 dot（vector 段 fp32；dot 操作数 fp32，acc 恒 fp32）──
     qe = qc * tl.math.exp2(gc)           # [BT, BK]  fp32
     ke = kc * tl.math.exp2(-gc)          # [BT, BK]  fp32
-    Aqk_full = tl.dot(qe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # [BT, BT]
+    Aqk_full = tl.dot(qe, tl.trans(ke))  # [BT, BT]
     kbe = (kc * betac[:, None]) * tl.math.exp2(gc)                     # fp32
-    Akk_full = tl.dot(kbe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # [BT, BT]
+    Akk_full = tl.dot(kbe, tl.trans(ke))  # [BT, BT]
 
     # ── 对角线 16×16 block 掩码 (值置 0, 非 store mask) ──
     br = o_r // BC
@@ -311,10 +315,11 @@ def _token_parallel_kernel_hm2(
         eneg = tl.math.exp2(-gc)
         qe = qc * eg * scale               # fp32 vector 段 (含 scale 折叠)
         ke = kc * eneg                     # fp32 vector 段
-        ke = tl.minimum(tl.maximum(ke, -65504.0), 65504.0)  # fp16 饱和, 防链上大 gk 溢出 inf→nan
-        Aqk_full = tl.dot(qe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # acc fp32
+        # 不套 fp16 饱和 clamp: 会把真实值 exp2(-g)≈4.7e7 截到 65504，
+        # 而 fp32 dot 没有 inf→nan 之虞。
+        Aqk_full = tl.dot(qe, tl.trans(ke))  # acc fp32
         kbe = (kc * betac[:, None]) * eg   # fp32 vector 段
-        Akk_full = tl.dot(kbe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # acc fp32
+        Akk_full = tl.dot(kbe, tl.trans(ke))  # acc fp32
 
         Aqk_full = tl.where(keep, Aqk_full, 0.0)
         Akk_full = tl.where(strict, Akk_full, 0.0)
@@ -322,91 +327,6 @@ def _token_parallel_kernel_hm2(
         # fp16: store 前才 cast 到缓冲元素 dtype (Aqk/AkkScratch 为 fp16)
         tl.store(base_aqk + row_akk + col_bt, Aqk_full.to(Aqk.dtype.element_ty))
         tl.store(base_akk + row_akk + col_bt, Akk_full.to(AkkScratch.dtype.element_ty))
-
-
-@triton.jit(do_not_specialize=["T"])
-def _token_parallel_kernel_hm3(
-    q, k, g, beta, Aqk, AkkOut,
-    scale,
-    T, H: tl.constexpr, K: tl.constexpr,
-    BT: tl.constexpr, BC: tl.constexpr, HM: tl.constexpr,
-    NS: tl.constexpr,
-):
-    """head-merged v3: 同 hm2, 但 Akk 对角线块用 tl.gather 在 kernel 内收拢为
-    [BT,BC] 紧凑写回 [B,T,H,BC]，消除 scratch 满宽写 + driver torch.gather
-    （msprof: gather 链 ~2ms/调用）。K 需为 2 幂。
-
-    DEPRECATED: triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时
-    数值错误 (Akk max_diff≈0.32) 且 ~3x 慢, driver 已切回 hm2 路径
-    (turbo_token_parallel_triton)。保留仅作参考, 待 tl.gather 修复后可复用。"""
-    i_cg, i_hg = tl.program_id(0), tl.program_id(1)
-    NT = tl.cdiv(T, BT)
-    n_hg = H // HM
-    i_b = i_hg // n_hg
-    hg0 = i_hg % n_hg
-    bos = i_b * T
-    i_c = i_cg % NT
-    chunk_start = i_c * BT
-
-    o_k = tl.arange(0, K)
-    o_r = tl.arange(0, BT)
-    T_fp = T.to(tl.float32)
-    chunk_start_fp = chunk_start.to(tl.float32)
-    m_rows = (chunk_start_fp + o_r.to(tl.float32)) < T_fp
-
-    br = o_r // BC
-    bc_ = tl.arange(0, BT) // BC
-    ri = o_r % BC
-    ci = tl.arange(0, BT) % BC
-    diag = br[:, None] == bc_[None, :]
-    keep = diag & (ri[:, None] >= ci[None, :])      # Aqk: j<=i 同 sub-chunk
-    o_cc = tl.arange(0, BC)
-    col_idx = (o_r // BC)[:, None] * BC + o_cc[None, :]   # [BT,BC] 行依赖列偏移
-    strict = (o_r % BC)[:, None] > o_cc[None, :]          # Akk: 块内 j<i
-
-    row_offset = (chunk_start + o_r[:, None]) * H * K
-    col_bt = tl.arange(0, BT)[None, :]
-    row_aqk = (chunk_start + o_r[:, None]) * H * BT
-    row_akk = (chunk_start + o_r[:, None]) * H * BC
-
-    for hh in tl.range(HM, num_stages=NS):
-        i_h = hg0 * HM + hh
-        base_q = q + bos * H * K + i_h * K
-        base_k = k + bos * H * K + i_h * K
-        base_g = g + bos * H * K + i_h * K
-        base_beta = beta + bos * H + i_h
-        base_aqk = Aqk + bos * H * BT + i_h * BT
-        base_akk = AkkOut + bos * H * BC + i_h * BC
-
-        qc = tl.load(base_q + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        kc = tl.load(base_k + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        gc = tl.load(base_g + row_offset + o_k[None, :],
-                     mask=m_rows[:, None], other=0.0,
-                     care_padding=False).to(tl.float32)
-        betac = tl.load(base_beta + (chunk_start + o_r) * H,
-                        mask=m_rows, other=0.0, care_padding=False).to(tl.float32)
-
-        eg = tl.math.exp2(gc)
-        eneg = tl.math.exp2(-gc)
-        qe = qc * eg * scale               # fp32 vector 段 (含 scale 折叠)
-        ke = kc * eneg                     # fp32 vector 段
-        ke = tl.minimum(tl.maximum(ke, -65504.0), 65504.0)  # fp16 饱和, 防链上大 gk 溢出 inf→nan
-        Aqk_full = tl.dot(qe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # acc fp32
-        kbe = (kc * betac[:, None]) * eg   # fp32 vector 段
-        Akk_full = tl.dot(kbe.to(tl.float16), tl.trans(ke.to(tl.float16)))  # acc fp32
-
-        Aqk_full = tl.where(keep, Aqk_full, 0.0)
-        # fp16: store 前才 cast 到缓冲元素 dtype (Aqk/AkkOut 为 fp16)
-        tl.store(base_aqk + row_aqk + col_bt, Aqk_full.to(Aqk.dtype.element_ty))
-
-        Akk_diag = tl.gather(Akk_full, col_idx, axis=1)   # [BT,BC]
-        Akk_diag = tl.where(strict, Akk_diag, 0.0)
-        tl.store(base_akk + row_akk + o_cc[None, :],
-                 Akk_diag.to(AkkOut.dtype.element_ty))
 
 
 def _gather_akk_diag(scratch, BC, T=None):
@@ -467,16 +387,16 @@ def turbo_token_parallel_triton(
         scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float16)
         if Akk is None:
             Akk = torch.empty(B, TP, H, BC, device=dev, dtype=torch.float16)
-        # 注意: 不用 _token_parallel_kernel_hm3 (kernel 内 tl.gather 收拢)。
-        # triton-ascend 3.2.1 上 tl.gather 的 src 为 tl.dot 输出时结果错误
-        # (实测 Akk max_diff≈0.32) 且退化 ~3x 慢。改回 hm2: 满宽写 scratch +
+        # 不用"kernel 内 tl.gather 收拢对角线块"的写法: triton-ascend 3.2.1 上
+        # tl.gather 的 src 为 tl.dot 输出时结果错误 (实测 Akk max_diff≈0.32)
+        # 且退化 ~3x 慢。故走 hm2: 满宽写 scratch +
         # driver torch.gather 收拢 (实测 max_diff≈8.9e-8)。
         _token_parallel_kernel_hm2[grid](
             q, k, gk, beta, Aqk, scratch, float(scale),
             T, H=H, K=K, BT=BT, BC=BC, HM=HM, num_warps=_K2_NW,
         )
         torch.npu.synchronize()
-        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
+        Akk[:, :T].copy_(_gather_akk_diag(scratch, BC, T=T))
         return Aqk[:, :T], Akk[:, :T]
     # 回退路径: K 非 2 幂 → 原 _token_parallel_kernel + torch.gather 收拢
     scratch = torch.empty(B, TP, H, BT, device=dev, dtype=torch.float16)
@@ -490,5 +410,5 @@ def turbo_token_parallel_triton(
     if Akk is None:
         Akk = _gather_akk_diag(scratch, BC, T=T)
     else:
-        Akk.copy_(_gather_akk_diag(scratch, BC, T=T))
+        Akk[:, :T].copy_(_gather_akk_diag(scratch, BC, T=T))
     return Aqk, Akk
